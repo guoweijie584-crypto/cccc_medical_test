@@ -1,0 +1,652 @@
+{
+  "schema_version": "2.0",
+  "description": "血糖管理 Agent 评测数据集（基于真实患者数据结构）",
+  "data_source": "data/patient_structured/patient_structured_50_desensitize.json",
+  "test_cases": [
+    {
+      "id": "TC001",
+      "category": "medication",
+      "subcategory": "newly_diagnosed_treatment",
+      "patient_reference": "PAT_bjhl2nvy9f",
+      "patient_profile": {
+        "患者UUID": "PAT_bjhl2nvy9f",
+        "基础信息": {
+          "年龄": 39,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "糖尿病发现年份": 2019,
+          "治疗方式": "",
+          "是否规律用药": "否",
+          "是否监测血糖": "是",
+          "每周测血糖次数": 2
+        },
+        "生活习惯": {
+          "运动频率": "未知",
+          "饮食习惯": "均衡",
+          "是否吸烟": "是",
+          "每日吸烟数量": 15,
+          "是否饮酒": "否"
+        },
+        "并发症": {
+          "急性并发症": "",
+          "慢性并发症": "",
+          "心血管疾病信息": ""
+        }
+      },
+      "question": "我刚确诊2型糖尿病，医生说要吃药，我应该吃什么药？",
+      "expected_answer_points": [
+        "首选二甲双胍（如无禁忌）",
+        "初始剂量500mg，随餐服用",
+        "需评估肾功能（eGFR）",
+        "配合生活方式干预",
+        "3个月后复查HbA1c"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第四章"
+    },
+    {
+      "id": "TC002",
+      "category": "lifestyle",
+      "subcategory": "smoking_cessation",
+      "patient_reference": "PAT_bjhl2nvy9f",
+      "patient_profile": {
+        "患者UUID": "PAT_bjhl2nvy9f",
+        "基础信息": {
+          "年龄": 39,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "糖尿病发现年份": 2019
+        },
+        "生活习惯": {
+          "是否吸烟": "是",
+          "每日吸烟数量": 15,
+          "是否饮酒": "否"
+        }
+      },
+      "question": "我有糖尿病，但每天抽一包烟，需要戒烟吗？",
+      "expected_answer_points": [
+        "强烈建议戒烟",
+        "吸烟增加心血管疾病风险",
+        "吸烟加重胰岛素抵抗",
+        "可寻求戒烟门诊帮助",
+        "戒烟后血糖控制可能改善"
+      ],
+      "safety_critical": false,
+      "reference": "中国2型糖尿病防治指南2020版，第七章"
+    },
+    {
+      "id": "TC003",
+      "category": "glucose_monitoring",
+      "subcategory": "testing_frequency",
+      "patient_reference": "PAT_sample_02",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 55,
+          "性别": "女",
+          "糖尿病类型": "2型",
+          "治疗方式": "二甲双胍+格列美脲",
+          "是否规律用药": "是",
+          "每周测血糖次数": 0
+        }
+      },
+      "question": "我吃药很规律，但平时不测血糖，这样行吗？",
+      "expected_answer_points": [
+        "建议定期监测血糖",
+        "至少每3个月测HbA1c",
+        "血糖波动大时需增加监测频率",
+        "空腹和餐后2小时都要测",
+        "记录血糖日记有助于调整治疗方案"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第三章"
+    },
+    {
+      "id": "TC004",
+      "category": "complication",
+      "subcategory": "cardiovascular_risk",
+      "patient_reference": "PAT_sample_03",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 62,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "糖尿病发现年份": 2015,
+          "心血管疾病信息": "高血压"
+        },
+        "生活习惯": {
+          "是否吸烟": "是"
+        }
+      },
+      "question": "我有糖尿病和高血压，还抽烟，风险很大吗？",
+      "expected_answer_points": [
+        "心血管疾病风险显著增加",
+        "高血压+糖尿病+吸烟是危险组合",
+        "血压目标应<130/80 mmHg",
+        "强烈建议戒烟",
+        "可能需要阿司匹林一级预防"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第八章"
+    },
+    {
+      "id": "TC005",
+      "category": "medication",
+      "subcategory": "hypoglycemia_prevention",
+      "patient_reference": "PAT_sample_04",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 72,
+          "性别": "女",
+          "糖尿病类型": "2型",
+          "治疗方式": "胰岛素",
+          "是否规律用药": "是"
+        }
+      },
+      "question": "我打胰岛素，有时候会头晕出汗，是不是低血糖了？",
+      "expected_answer_points": [
+        "可能是低血糖症状",
+        "立即测血糖确认",
+        "<3.9 mmol/L为低血糖",
+        "立即补充15g快糖",
+        "15分钟后复测血糖",
+        "记录事件，调整胰岛素剂量"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第五章"
+    },
+    {
+      "id": "TC006",
+      "category": "nutrition",
+      "subcategory": "dietary_structure",
+      "patient_reference": "PAT_sample_05",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 48,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "BMI": 28.5
+        },
+        "生活习惯": {
+          "饮食习惯": "高脂饮食",
+          "运动频率": "从不"
+        }
+      },
+      "question": "我偏胖，血糖高，应该怎么调整饮食？",
+      "expected_answer_points": [
+        "控制总热量摄入",
+        "减少饱和脂肪和反式脂肪",
+        "增加膳食纤维（蔬菜、全谷物）",
+        "选择低GI碳水化合物",
+        "限制精制糖和高糖食物",
+        "合理分配三餐"
+      ],
+      "safety_critical": false,
+      "reference": "中国2型糖尿病防治指南2020版，第七章"
+    },
+    {
+      "id": "TC007",
+      "category": "exercise",
+      "subcategory": "physical_activity",
+      "patient_reference": "PAT_sample_06",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 45,
+          "性别": "女",
+          "糖尿病类型": "2型",
+          "并发症": "视网膜病变"
+        },
+        "生活习惯": {
+          "运动频率": "从不"
+        }
+      },
+      "question": "我有糖尿病视网膜病变，能运动吗？",
+      "expected_answer_points": [
+        "可以运动，但需避免剧烈活动",
+        "避免屏气用力的动作（如举重）",
+        "推荐有氧运动（快走、游泳）",
+        "运动前检查眼底情况",
+        "避免头部剧烈晃动"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第七章"
+    },
+    {
+      "id": "TC008",
+      "category": "medication",
+      "subcategory": "drug_interaction",
+      "patient_reference": "PAT_sample_07",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 58,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "治疗方式": "二甲双胍",
+          "药物过敏史": "磺胺类过敏"
+        }
+      },
+      "question": "我对磺胺药过敏，能吃降糖药吗？",
+      "expected_answer_points": [
+        "二甲双胍与磺胺类无交叉过敏",
+        "但磺脲类药物（如格列美脲）需注意",
+        "建议咨询医生或药师",
+        "用药后观察过敏反应",
+        "可考虑DPP-4抑制剂等替代"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第四章"
+    },
+    {
+      "id": "TC009",
+      "category": "glucose_interpretation",
+      "subcategory": "hba1c_target",
+      "patient_reference": "PAT_sample_08",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 35,
+          "性别": "女",
+          "糖尿病类型": "1型",
+          "糖尿病发现年份": 2020
+        }
+      },
+      "question": "我是1型糖尿病，糖化血红蛋白应该控制在多少？",
+      "expected_answer_points": [
+        "一般目标<7%",
+        "年轻患者可更严格（<6.5%）",
+        "有低血糖风险者可放宽（<7.5%）",
+        "需个体化设定目标",
+        "定期监测HbA1c（每3个月）"
+      ],
+      "safety_critical": false,
+      "reference": "中国2型糖尿病防治指南2020版，第三章"
+    },
+    {
+      "id": "TC010",
+      "category": "complication",
+      "subcategory": "foot_care",
+      "patient_reference": "PAT_sample_09",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 65,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "糖尿病发现年份": 2010,
+          "慢性并发症": "糖尿病足"
+        }
+      },
+      "question": "我有糖尿病足，平时怎么护理？",
+      "expected_answer_points": [
+        "每日检查双足（颜色、温度、伤口）",
+        "保持足部清洁干燥",
+        "穿合适的鞋袜，避免磨脚",
+        "不要自行处理鸡眼或老茧",
+        "定期到专科门诊随访",
+        "任何伤口及时就医"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第八章"
+    },
+    {
+      "id": "TC011",
+      "category": "medication",
+      "subcategory": "metformin_renal",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 68,
+          "性别": "女",
+          "糖尿病类型": "2型",
+          "糖尿病发现年份": 2015
+        },
+        "并发症": {
+          "慢性并发症": "糖尿病肾病3期"
+        }
+      },
+      "question": "我有糖尿病肾病，肌酐有点高，还能吃二甲双胍吗？",
+      "expected_answer_points": [
+        "需评估eGFR水平",
+        "eGFR 30-45：减量使用",
+        "eGFR <30：禁用二甲双胍",
+        "考虑改用SGLT2抑制剂或GLP-1受体激动剂",
+        "定期监测肾功能"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第四章"
+    },
+    {
+      "id": "TC012",
+      "category": "nutrition",
+      "subcategory": "alcohol_guidance",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 42,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "治疗方式": "格列美脲"
+        },
+        "生活习惯": {
+          "是否饮酒": "是",
+          "饮酒频次": "每天",
+          "饮酒量": "白酒2两"
+        }
+      },
+      "question": "我喜欢晚上喝点白酒，对血糖有影响吗？",
+      "expected_answer_points": [
+        "酒精可导致低血糖，尤其使用磺脲类药物时",
+        "饮酒后低血糖风险增加",
+        "建议限制饮酒或戒酒",
+        "饮酒时需进食，不可空腹",
+        "加强血糖监测"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第七章"
+    },
+    {
+      "id": "TC013",
+      "category": "exercise",
+      "subcategory": "hypoglycemia_prevention_exercise",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 35,
+          "性别": "女",
+          "糖尿病类型": "1型",
+          "治疗方式": "胰岛素泵"
+        }
+      },
+      "question": "我想开始运动减肥，怎么避免运动时低血糖？",
+      "expected_answer_points": [
+        "运动前血糖应>5.6 mmol/L",
+        "运动前可减少胰岛素剂量",
+        "运动前后监测血糖",
+        "随身携带糖果以备低血糖",
+        "避免在胰岛素作用高峰时运动"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第七章"
+    },
+    {
+      "id": "TC014",
+      "category": "complication",
+      "subcategory": "eye_screening",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 50,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "糖尿病发现年份": 2012
+        },
+        "并发症": {
+          "视网膜病变信息": ""
+        }
+      },
+      "question": "我糖尿病8年了，视力有点模糊，需要看眼科吗？",
+      "expected_answer_points": [
+        "需立即进行眼底检查",
+        "2型糖尿病患者应每年筛查眼底",
+        "视力模糊可能提示糖尿病视网膜病变",
+        "早期发现可激光治疗预防失明",
+        "同时需控制血糖、血压、血脂"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第八章"
+    },
+    {
+      "id": "TC015",
+      "category": "medication",
+      "subcategory": "insulin_initiation",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 58,
+          "性别": "女",
+          "糖尿病类型": "2型",
+          "糖尿病发现年份": 2010,
+          "治疗方式": "二甲双胍+格列美脲",
+          "HbA1c": "9.2%"
+        }
+      },
+      "question": "我吃两种药血糖还是高，糖化9.2%，要不要打胰岛素？",
+      "expected_answer_points": [
+        "HbA1c 9.2%提示血糖控制不佳",
+        "口服药最大剂量仍不达标应考虑胰岛素",
+        "可从基础胰岛素（如甘精胰岛素）开始",
+        "起始剂量0.1-0.2 U/kg",
+        "需教育患者克服胰岛素恐惧"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第四章"
+    },
+    {
+      "id": "TC016",
+      "category": "glucose_monitoring",
+      "subcategory": "cgm_usage",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 28,
+          "性别": "男",
+          "糖尿病类型": "1型",
+          "治疗方式": "胰岛素"
+        }
+      },
+      "question": "动态血糖监测（CGM）有什么用？我需要用吗？",
+      "expected_answer_points": [
+        "CGM可连续监测血糖波动",
+        "1型糖尿病患者推荐使用",
+        "可发现隐匿性高低血糖",
+        "有助于优化胰岛素剂量",
+        "TIR（目标范围内时间）应>70%"
+      ],
+      "safety_critical": false,
+      "reference": "中国2型糖尿病防治指南2020版，第三章"
+    },
+    {
+      "id": "TC017",
+      "category": "special_population",
+      "subcategory": "elderly_diabetes",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 78,
+          "性别": "女",
+          "糖尿病类型": "2型",
+          "糖尿病发现年份": 2008,
+          "并发症": "轻度认知障碍"
+        }
+      },
+      "question": "我78岁了，血糖控制目标要放宽吗？",
+      "expected_answer_points": [
+        "老年患者目标应个体化",
+        "健康老年人：HbA1c <7.5%",
+        "有并发症者：HbA1c <8.0-8.5%",
+        "避免低血糖优先",
+        "简化用药方案"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第九章"
+    },
+    {
+      "id": "TC018",
+      "category": "special_population",
+      "subcategory": "gestational_diabetes",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 30,
+          "性别": "女",
+          "妊娠状态": "孕24周"
+        }
+      },
+      "question": "我怀孕24周，血糖有点高，对宝宝有影响吗？",
+      "expected_answer_points": [
+        "妊娠期糖尿病需严格控制血糖",
+        "空腹目标<5.3 mmol/L",
+        "餐后1小时<7.8 mmol/L",
+        "控制不佳可影响胎儿发育",
+        "首选饮食运动控制，必要时用胰岛素"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第十章"
+    },
+    {
+      "id": "TC019",
+      "category": "medication",
+      "subcategory": "sglt2i_benefits",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 55,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "并发症": "冠心病",
+          "治疗方式": "二甲双胍"
+        }
+      },
+      "question": "我有糖尿病和冠心病，听说有种药对心脏好，是什么药？",
+      "expected_answer_points": [
+        "SGLT2抑制剂（如达格列净）有心血管保护作用",
+        "可降低心衰住院风险",
+        "适用于合并ASCVD的2型糖尿病患者",
+        "同时有肾脏保护作用",
+        "需注意泌尿系感染风险"
+      ],
+      "safety_critical": false,
+      "reference": "中国2型糖尿病防治指南2020版，第四章"
+    },
+    {
+      "id": "TC020",
+      "category": "lifestyle",
+      "subcategory": "weight_management",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 40,
+          "性别": "女",
+          "糖尿病类型": "2型",
+          "BMI": 31.5,
+          "治疗方式": "二甲双胍"
+        }
+      },
+      "question": "我很胖，BMI 31，减肥对血糖有帮助吗？",
+      "expected_answer_points": [
+        "减重可显著改善胰岛素敏感性",
+        "减重5-10%即可改善血糖控制",
+        "BMI>32.5可考虑代谢手术",
+        "配合饮食控制和运动",
+        "减重后可能减少用药"
+      ],
+      "safety_critical": false,
+      "reference": "中国2型糖尿病防治指南2020版，第七章"
+    },
+    {
+      "id": "TC021",
+      "category": "complication",
+      "subcategory": "neuropathy",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 60,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "糖尿病发现年份": 2005
+        },
+        "并发症": {
+          "慢性并发症": "手脚麻木"
+        }
+      },
+      "question": "我手脚经常发麻，像蚂蚁爬，是糖尿病引起的吗？",
+      "expected_answer_points": [
+        "可能是糖尿病周围神经病变",
+        "典型症状为对称性手足麻木、刺痛",
+        "需进行神经传导检查确诊",
+        "控制血糖是根本",
+        "可使用甲钴胺、硫辛酸等药物"
+      ],
+      "safety_critical": false,
+      "reference": "中国2型糖尿病防治指南2020版，第八章"
+    },
+    {
+      "id": "TC022",
+      "category": "medication",
+      "subcategory": "dose_timing",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 52,
+          "性别": "女",
+          "糖尿病类型": "2型",
+          "治疗方式": "阿卡波糖"
+        }
+      },
+      "question": "阿卡波糖是饭前吃还是饭后吃？",
+      "expected_answer_points": [
+        "阿卡波糖应与第一口饭同时嚼服",
+        "饭前过早服用效果不佳",
+        "饭后服用无效",
+        "漏餐时相应漏服药物",
+        "常见副作用为腹胀、排气"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第四章"
+    },
+    {
+      "id": "TC023",
+      "category": "glucose_interpretation",
+      "subcategory": "dawn_phenomenon",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 48,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "治疗方式": "胰岛素"
+        }
+      },
+      "question": "我睡前血糖正常，但早上空腹总是高，怎么回事？",
+      "expected_answer_points": [
+        "可能是黎明现象",
+        "凌晨激素分泌导致血糖升高",
+        "也可能是夜间低血糖后的反跳",
+        "建议监测凌晨3点血糖鉴别",
+        "根据原因调整胰岛素方案"
+      ],
+      "safety_critical": false,
+      "reference": "中国2型糖尿病防治指南2020版，第三章"
+    },
+    {
+      "id": "TC024",
+      "category": "emergency",
+      "subcategory": "dka_warning",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 25,
+          "性别": "女",
+          "糖尿病类型": "1型",
+          "治疗方式": "胰岛素"
+        }
+      },
+      "question": "我最近恶心呕吐，呼吸有烂苹果味，需要去医院吗？",
+      "expected_answer_points": [
+        "高度怀疑糖尿病酮症酸中毒（DKA）",
+        "是糖尿病急性并发症",
+        "需立即急诊就医",
+        "可能危及生命",
+        "不要延误"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第六章"
+    },
+    {
+      "id": "TC025",
+      "category": "medication",
+      "subcategory": "travel_preparation",
+      "patient_profile": {
+        "基础信息": {
+          "年龄": 45,
+          "性别": "男",
+          "糖尿病类型": "2型",
+          "治疗方式": "胰岛素"
+        }
+      },
+      "question": "我要出差一周，胰岛素怎么携带保存？",
+      "expected_answer_points": [
+        "胰岛素需随身携带，不要托运",
+        "未开封胰岛素2-8°C保存",
+        "开封后室温保存，避免冷冻",
+        "准备双倍药量以防万一",
+        "携带血糖仪和低血糖急救食品"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第四章"
+    }
+  ]
+}

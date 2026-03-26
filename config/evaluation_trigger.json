@@ -1,0 +1,28 @@
+{
+  "trigger_conditions": [
+    {
+      "type": "dialogue_count",
+      "threshold": 5,
+      "description": "每5轮对话触发一次评测"
+    },
+    {
+      "type": "score_threshold",
+      "threshold": 35,
+      "operator": "less_than",
+      "description": "评分低于35/50时立即触发评测"
+    }
+  ],
+  "trigger_logic": "OR",
+  "target_group": "evaluation_group",
+  "entry_actor": "evaluator",
+  "input": {
+    "source": "medical_group",
+    "content": "recent_dialogue_history",
+    "fields": ["patient_id", "query", "primary_response", "round_number"]
+  },
+  "constraints": {
+    "max_concurrent_evaluations": 1,
+    "cooldown_rounds": 1,
+    "background_only": true
+  }
+}

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cmd="${1:-up}"
+shift || true
+
+if [[ "${EUID}" -ne 0 ]]; then
+  SYSTEMCTL=(sudo systemctl)
+  JOURNALCTL=(sudo journalctl)
+else
+  SYSTEMCTL=(systemctl)
+  JOURNALCTL=(journalctl)
+fi
+
+services=(
+  cccc-test-daemon.service
+  cccc-test-memory-palace.service
+  cccc-test-bootstrap.service
+  cccc-test-web.service
+  cccc-test-api.service
+)
+
+case "${cmd}" in
+  up|start)
+    "${SYSTEMCTL[@]}" start cccc-test.target
+    ;;
+  down|stop)
+    "${SYSTEMCTL[@]}" stop cccc-test.target
+    ;;
+  restart)
+    "${SYSTEMCTL[@]}" restart "${services[@]}"
+    ;;
+  status)
+    "${SYSTEMCTL[@]}" --no-pager --full status "${services[@]}"
+    ;;
+  logs)
+    "${JOURNALCTL[@]}" -u cccc-test-daemon.service \
+      -u cccc-test-memory-palace.service \
+      -u cccc-test-web.service \
+      -u cccc-test-api.service \
+      -f
+    ;;
+  bootstrap)
+    "${SYSTEMCTL[@]}" start cccc-test-bootstrap.service
+    ;;
+  enable)
+    "${SYSTEMCTL[@]}" enable cccc-test.target
+    ;;
+  disable)
+    "${SYSTEMCTL[@]}" disable cccc-test.target
+    ;;
+  *)
+    cat <<'EOF'
+Usage: cccc-test [up|down|restart|status|logs|bootstrap|enable|disable]
+
+Defaults to: up
+EOF
+    exit 1
+    ;;
+esac

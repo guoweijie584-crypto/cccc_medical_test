@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_script_path() {
+  local source_path="${1:-}"
+  if [[ -z "${source_path}" ]]; then
+    return 1
+  fi
+
+  while [[ -h "${source_path}" ]]; do
+    local source_dir
+    source_dir="$(cd -P -- "$(dirname -- "${source_path}")" && pwd)"
+    local linked_path
+    linked_path="$(readlink "${source_path}")"
+    if [[ "${linked_path}" != /* ]]; then
+      source_path="${source_dir}/${linked_path}"
+    else
+      source_path="${linked_path}"
+    fi
+  done
+
+  local resolved_dir
+  resolved_dir="$(cd -P -- "$(dirname -- "${source_path}")" && pwd)"
+  printf '%s\n' "${resolved_dir}/$(basename -- "${source_path}")"
+}
+
+SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "${SCRIPT_PATH}")" && pwd)"
+PROJECT_ROOT="$(cd -P -- "${SCRIPT_DIR}/.." && pwd)"
+BACKEND_DIR="${PROJECT_ROOT}/backend"
+POSIX_VENV_PYTHON="${BACKEND_DIR}/.venv/bin/python"
+WINDOWS_VENV_PYTHON="${BACKEND_DIR}/.venv/Scripts/python.exe"
+ENV_FILE="${PROJECT_ROOT}/.env"
+DOCKER_ENV_FILE="${PROJECT_ROOT}/.env.docker"
+DEFAULT_DB_PATH="${PROJECT_ROOT}/demo.db"
+DOCKER_INTERNAL_SQLITE_PREFIXES=("/app/" "/data/")
+
+is_windows_host_shell() {
+  case "${OSTYPE:-}" in
+    msys*|cygwin*|win32*)
+      return 0
+      ;;
+  esac
+
+  [[ "${OS:-}" == "Windows_NT" ]]
+}
+
+prefer_windows_venv_layout() {
+  is_windows_host_shell
+}
+
+normalize_path_slashes() {
+  local value="${1:-}"
+  printf '%s' "${value//\\//}"
+}
+
+uppercase_windows_drive() {
+  local value
+  value="$(normalize_path_slashes "${1:-}")"
+  if [[ "${value}" =~ ^([a-zA-Z]):/?(.*)$ ]]; then
+    local drive rest
+    drive="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')"
+    rest="${BASH_REMATCH[2]}"
+    if [[ -n "${rest}" ]]; then
+      printf '%s:/%s' "${drive}" "${rest}"
+    else
+      printf '%s:/' "${drive}"
+    fi
+    return 0
+  fi
+  printf '%s' "${value}"
+}
+
+resolve_windows_host_path() {
+  local value="${1:-}"
+  local converted=""
+
+  value="$(normalize_path_slashes "${value}")"
+  if [[ -z "${value}" ]]; then
+    printf '%s' "${value}"
+    return 0
+  fi
+
+  if command -v cygpath >/dev/null 2>&1; then
+    converted="$(cygpath -am "${value}" 2>/dev/null || true)"
+    converted="$(uppercase_windows_drive "${converted}")"
+    if [[ "${converted}" =~ ^[A-Z]:/.*$ ]]; then
+      printf '%s' "${converted}"
+      return 0
+    fi
+  fi
+
+  if command -v wslpath >/dev/null 2>&1; then
+    converted="$(wslpath -w "${value}" 2>/dev/null || true)"
+    converted="$(uppercase_windows_drive "${converted}")"
+    if [[ "${converted}" =~ ^[A-Z]:/.*$ ]]; then
+      printf '%s' "${converted}"
+      return 0
+    fi
+  fi
+
+  if [[ "${value}" =~ ^/mnt/([a-zA-Z])/(.*)$ ]]; then
+    printf '%s:/%s' "$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')" "${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  if [[ "${value}" =~ ^/([a-zA-Z])/(.*)$ ]]; then
+    printf '%s:/%s' "$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')" "${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  printf '%s' "$(uppercase_windows_drive "${value}")"
+}
+
+prefer_windows_path_semantics() {
+  if [[ "${VENV_PYTHON:-}" == *.exe ]]; then
+    return 0
+  fi
+
+  prefer_windows_venv_layout
+}
+
+read_env_value() {
+  local file_path="$1"
+  local key="$2"
+  if [[ ! -f "${file_path}" ]]; then
+    return 0
+  fi
+  awk -v key="${key}" '
+    function ltrim(s) { sub(/^[[:space:]]+/, "", s); return s }
+    function rtrim(s) { sub(/[[:space:]]+$/, "", s); return s }
+    function trim(s) { return rtrim(ltrim(s)) }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (line ~ /^[[:space:]]*#/ || index(line, "=") == 0) {
+        next
+      }
+      eq = index(line, "=")
+      current_key = trim(substr(line, 1, eq - 1))
+      if (current_key != key) {
+        next
+      }
+      value = trim(substr(line, eq + 1))
+      if (length(value) >= 2) {
+        first = substr(value, 1, 1)
+        last = substr(value, length(value), 1)
+        if ((first == "\"" || first == "'\''") && last == first) {
+          last_value = substr(value, 2, length(value) - 2)
+          next
+        }
+      }
+      sub(/[[:space:]]+#.*$/, "", value)
+      value = trim(value)
+      if (length(value) >= 2) {
+        first = substr(value, 1, 1)
+        last = substr(value, length(value), 1)
+        if ((first == "\"" || first == "'\''") && last == first) {
+          value = substr(value, 2, length(value) - 2)
+        }
+      }
+      last_value = value
+    }
+    END { printf "%s", last_value }
+  ' "${file_path}"
+}
+
+normalize_env_value() {
+  local value="${1:-}"
+  value="${value//$'\r'/}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ "${#value}" -ge 2 ]]; then
+    if [[ "${value:0:1}" == "\"" && "${value: -1}" == "\"" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+  fi
+  printf '%s' "${value}"
+}
+
+format_sqlite_absolute_url() {
+  local absolute_path="${1:-}"
+  absolute_path="$(normalize_path_slashes "${absolute_path%$'\r'}")"
+  if prefer_windows_path_semantics; then
+    absolute_path="$(resolve_windows_host_path "${absolute_path}")"
+  fi
+  absolute_path="$(uppercase_windows_drive "${absolute_path}")"
+  if [[ "${absolute_path}" =~ ^[A-Za-z]:/.*$ ]]; then
+    printf 'sqlite+aiosqlite:///%s' "${absolute_path}"
+    return 0
+  fi
+  while [[ "${absolute_path}" == /* ]]; do
+    absolute_path="${absolute_path#/}"
+  done
+  printf 'sqlite+aiosqlite:////%s' "${absolute_path}"
+}
+
+is_docker_internal_database_url() {
+  local value
+  value="$(normalize_env_value "${1:-}")"
+  local prefix
+  for prefix in "${DOCKER_INTERNAL_SQLITE_PREFIXES[@]}"; do
+    case "${value}" in
+      "sqlite+aiosqlite:///${prefix}"*|"sqlite+aiosqlite://${prefix}"*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+VENV_PYTHON=""
+if prefer_windows_venv_layout; then
+  if [[ -x "${WINDOWS_VENV_PYTHON}" ]]; then
+    VENV_PYTHON="${WINDOWS_VENV_PYTHON}"
+  elif [[ -x "${POSIX_VENV_PYTHON}" ]]; then
+    VENV_PYTHON="${POSIX_VENV_PYTHON}"
+  fi
+elif [[ -x "${POSIX_VENV_PYTHON}" ]]; then
+  VENV_PYTHON="${POSIX_VENV_PYTHON}"
+elif [[ -x "${WINDOWS_VENV_PYTHON}" ]]; then
+  VENV_PYTHON="${WINDOWS_VENV_PYTHON}"
+fi
+
+if [[ -z "${VENV_PYTHON}" ]]; then
+  echo "Missing backend virtualenv python: ${POSIX_VENV_PYTHON} or ${WINDOWS_VENV_PYTHON}" >&2
+  exit 1
+fi
+
+cd "${BACKEND_DIR}"
+
+runtime_database_url="$(normalize_env_value "${DATABASE_URL:-}")"
+effective_database_url="${runtime_database_url}"
+if [[ -z "${runtime_database_url}" && -f "${ENV_FILE}" ]]; then
+  effective_database_url="$(normalize_env_value "$(read_env_value "${ENV_FILE}" "DATABASE_URL")")"
+  if [[ -n "${effective_database_url}" ]]; then
+    export DATABASE_URL="${effective_database_url}"
+  fi
+fi
+
+if is_docker_internal_database_url "${effective_database_url}"; then
+  echo "Refusing to start repo-local stdio MCP with Docker-internal DATABASE_URL: ${effective_database_url}" >&2
+  echo "The current .env points to a container-only sqlite path (for example /app/... or /data/...)." >&2
+  echo "For local stdio, regenerate .env with 'bash scripts/apply_profile.sh macos b' or set DATABASE_URL to a host absolute path." >&2
+  echo "If you want the containerized database/service, connect your client to the Docker /sse endpoint instead." >&2
+  exit 1
+fi
+
+# Reuse the repo's configured DATABASE_URL when .env exists so MCP clients and
+# the Dashboard/API keep talking to the same SQLite file. Fall back to demo.db
+# only for a minimal no-.env local boot.
+if [[ -z "$(normalize_env_value "${DATABASE_URL:-}")" && ! -f "${ENV_FILE}" ]]; then
+  if [[ -f "${DOCKER_ENV_FILE}" ]]; then
+    echo "Refusing to fall back to demo.db while ${DOCKER_ENV_FILE} exists." >&2
+    echo "The repo-local stdio wrapper does not reuse Docker's /app/data database path." >&2
+    echo "Create a local .env for the SQLite file you want, or connect your client to the Docker /sse endpoint instead." >&2
+    exit 1
+  fi
+  export DATABASE_URL="$(format_sqlite_absolute_url "${DEFAULT_DB_PATH}")"
+fi
+
+runtime_remote_timeout="$(normalize_env_value "${RETRIEVAL_REMOTE_TIMEOUT_SEC:-}")"
+if [[ -z "${runtime_remote_timeout}" && -f "${ENV_FILE}" ]]; then
+  runtime_remote_timeout="$(normalize_env_value "$(read_env_value "${ENV_FILE}" "RETRIEVAL_REMOTE_TIMEOUT_SEC")")"
+fi
+if [[ -n "${runtime_remote_timeout}" ]]; then
+export RETRIEVAL_REMOTE_TIMEOUT_SEC="${runtime_remote_timeout}"
+else
+  export RETRIEVAL_REMOTE_TIMEOUT_SEC="8"
+fi
+
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
+exec_backend_entrypoint() {
+  local backend_entrypoint="$1"
+  shift
+
+  if [[ "${backend_entrypoint}" == *.exe ]]; then
+    exec "${backend_entrypoint}" "$@"
+  fi
+
+  local header=""
+  header="$(LC_ALL=C head -c 2 "${backend_entrypoint}" 2>/dev/null || true)"
+  if [[ "${header}" == '#!' ]]; then
+    exec bash <(tr -d '\r' < "${backend_entrypoint}") "$@"
+  fi
+
+  exec "${backend_entrypoint}" "$@"
+}
+
+exec_backend_entrypoint "${VENV_PYTHON}" mcp_server.py

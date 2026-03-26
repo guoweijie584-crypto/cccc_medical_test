@@ -1,0 +1,13 @@
+[Unit]
+Description=CCCC Test Web
+After=cccc-test-daemon.service cccc-test-bootstrap.service
+Requires=cccc-test-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -lc 'set -a; source /etc/cccc-test.env; cd "$PROJECT_ROOT"; exec "$VENV_DIR/bin/python" scripts/run_cccc_web.py --host "$CCCC_WEB_HOST" --port "$CCCC_WEB_PORT"'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

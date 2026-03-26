@@ -1,0 +1,58 @@
+services:
+  backend:
+    image: ${MEMORY_PALACE_BACKEND_IMAGE:-memory-palace-backend:latest}
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.backend
+    env_file:
+      - ${MEMORY_PALACE_DOCKER_ENV_FILE:-./.env.docker}
+    environment:
+      HOST: 0.0.0.0
+      # Docker defaults to WAL for the repository's named-volume deployment path.
+      # If you replace these volumes with NFS/CIFS bind mounts, override both values.
+      RUNTIME_WRITE_WAL_ENABLED: ${MEMORY_PALACE_DOCKER_WAL_ENABLED:-true}
+      RUNTIME_WRITE_JOURNAL_MODE: ${MEMORY_PALACE_DOCKER_JOURNAL_MODE:-wal}
+    volumes:
+      - memory_palace_data:/app/data
+      - memory_palace_snapshots:/app/snapshots
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${MEMORY_PALACE_BACKEND_PORT:-${NOCTURNE_BACKEND_PORT:-18000}}:8000"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/backend-healthcheck.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    image: ${MEMORY_PALACE_FRONTEND_IMAGE:-memory-palace-frontend:latest}
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.frontend
+    env_file:
+      - ${MEMORY_PALACE_DOCKER_ENV_FILE:-./.env.docker}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${MEMORY_PALACE_FRONTEND_PORT:-${NOCTURNE_FRONTEND_PORT:-3000}}:8080"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  memory_palace_data:
+    name: ${MEMORY_PALACE_DATA_VOLUME:-${NOCTURNE_DATA_VOLUME:-${COMPOSE_PROJECT_NAME:-memory-palace}_data}}
+  memory_palace_snapshots:
+    name: ${MEMORY_PALACE_SNAPSHOTS_VOLUME:-${NOCTURNE_SNAPSHOTS_VOLUME:-${COMPOSE_PROJECT_NAME:-memory-palace}_snapshots}}

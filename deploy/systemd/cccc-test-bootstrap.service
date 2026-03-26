@@ -1,0 +1,12 @@
+[Unit]
+Description=CCCC Test Bootstrap Groups
+After=cccc-test-daemon.service
+Requires=cccc-test-daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -lc 'set -a; source /etc/cccc-test.env; cd "$PROJECT_ROOT"; exec "$VENV_DIR/bin/python" bootstrap_cccc_native.py --runtime codex'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

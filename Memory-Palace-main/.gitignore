@@ -1,0 +1,86 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.env.docker
+
+# Local tooling metadata
+.claude/
+.codex/
+.cursor/
+.opencode/
+.gemini/
+.agent/
+.mcp.json
+.mcp.json.bak
+.playwright-cli/
+.tmp/
+
+# OS artifacts
+.DS_Store
+**/.DS_Store
+
+# Runtime data and logs
+demo.db
+*.db
+*.sqlite
+*.sqlite3
+*.init.lock
+*.migrate.lock
+*.log
+snapshots/
+backups/
+assets/
+
+# Python
+.venv
+.venv/
+backend/.venv
+**/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+backend/.pytest_cache/
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.venv
+frontend/.venv/
+frontend/src/*.tmp.test.jsx
+
+# Known local-only files
+nocturne_memory.db
+migration_log.json
+backend/backend.log
+frontend/frontend.log
+backend/tests/benchmark/.real_profile_cache/
+scripts/save_note_*.py
+scripts/add_user_pref.py
+scripts/mcp_stdio_trace_wrapper.py
+.tmp_tracked_files.txt
+
+# Local-only docs and benchmark notes
+PUSH_CHECKLIST.md
+code_review_report.md
+security_best_practices_report.md
+docs/improvement/
+docs/evaluation_old_vs_new_*.md
+docs/changelog/current_code_improvements_vs_legacy_docs.md
+docs/nodeseek_post.md
+docs/SETUP_NOTICE.md
+docs/skills/TRIGGER_SMOKE_REPORT.md
+docs/skills/MCP_LIVE_E2E_REPORT.md
+docs/skills/CLAUDE_SKILLS_AUDIT.md
+backend/docs/benchmark_*.md
+backend/tests/benchmark_results.md
+docs/images/IMAGE_PROMPTS_LOCAL.md
+
+# Generated benchmark outputs (keep local, do not track)
+backend/tests/benchmark/benchmark_results_*.md
+backend/tests/benchmark/profile_*.json
+backend/tests/benchmark/profile_*.md
+backend/tests/benchmark/*_metrics.json
+backend/tests/benchmark/*_metrics.md

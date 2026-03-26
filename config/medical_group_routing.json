@@ -1,0 +1,31 @@
+{
+  "routing_rules": [
+    {
+      "from": "user",
+      "to": "primary",
+      "condition": "default"
+    },
+    {
+      "from": "primary",
+      "to": "memory",
+      "condition": "retrieve_context"
+    },
+    {
+      "from": "primary",
+      "to": ["pharmacist", "nutritionist", "doctor"],
+      "condition": "parallel_consult",
+      "mode": "parallel"
+    },
+    {
+      "from": "primary",
+      "to": "user",
+      "condition": "final_response"
+    }
+  ],
+  "constraints": {
+    "pharmacist": { "direct_user_reply": false },
+    "nutritionist": { "direct_user_reply": false },
+    "doctor": { "direct_user_reply": false },
+    "memory": { "direct_user_reply": false }
+  }
+}

@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+ENV_FILE="${PROJECT_ROOT}/.env"
+OUTPUT_DIR="${PROJECT_ROOT}/backups"
+KEEP_COUNT="${MEMORY_PALACE_BACKUP_KEEP:-20}"
+
+normalize_cli_path() {
+  local raw_path="${1:-}"
+  if [[ -z "${raw_path}" ]]; then
+    printf '%s\n' "${raw_path}"
+    return 0
+  fi
+
+  if [[ "${raw_path}" =~ ^[A-Za-z]:[\\/].* ]]; then
+    if command -v cygpath >/dev/null 2>&1; then
+      cygpath -u "${raw_path}"
+      return 0
+    fi
+    if command -v wslpath >/dev/null 2>&1; then
+      wslpath -u "${raw_path}"
+      return 0
+    fi
+  fi
+
+  printf '%s\n' "${raw_path//\\//}"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/backup_memory.sh [--env-file <path>] [--output-dir <path>]
+       [--keep <count>]
+
+Creates a consistent SQLite backup using Python's sqlite3 backup API.
+Use `--keep 0` to disable backup rotation. Default: 20.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env-file)
+      ENV_FILE="$(normalize_cli_path "${2:-}")"
+      shift 2
+      ;;
+    --output-dir)
+      OUTPUT_DIR="$(normalize_cli_path "${2:-}")"
+      shift 2
+      ;;
+    --keep)
+      KEEP_COUNT="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "Environment file not found: ${ENV_FILE}" >&2
+  exit 1
+fi
+
+if [[ ! "${KEEP_COUNT}" =~ ^[0-9]+$ ]]; then
+  echo "--keep must be a non-negative integer, got: ${KEEP_COUNT}" >&2
+  exit 2
+fi
+
+resolve_python_bin() {
+  local candidate=""
+  local resolved=""
+  local explicit_candidates=(
+    "${PROJECT_ROOT}/backend/.venv/Scripts/python.exe"
+    "${PROJECT_ROOT}/backend/.venv/bin/python"
+  )
+
+  for resolved in "${explicit_candidates[@]}"; do
+    if [[ -n "${resolved}" && -x "${resolved}" ]]; then
+      printf '%s\n' "${resolved}"
+      return 0
+    fi
+  done
+
+  for candidate in python.exe python3 python py; do
+    resolved="$(command -v "${candidate}" || true)"
+    if [[ -z "${resolved}" ]]; then
+      continue
+    fi
+    if [[ "${resolved}" == *"/WindowsApps/"* ]]; then
+      continue
+    fi
+    printf '%s\n' "${resolved}"
+    return 0
+  done
+  return 1
+}
+
+PYTHON_BIN="$(resolve_python_bin || true)"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "Python is required for consistent SQLite backup but was not found in PATH." >&2
+  exit 1
+fi
+
+export MEMORY_PALACE_PROJECT_ROOT="${PROJECT_ROOT}"
+export MEMORY_PALACE_BACKUP_ENV_FILE="${ENV_FILE}"
+export MEMORY_PALACE_BACKUP_OUTPUT_DIR="${OUTPUT_DIR}"
+export MEMORY_PALACE_BACKUP_KEEP_COUNT="${KEEP_COUNT}"
+
+"${PYTHON_BIN}" - <<'PY'
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from shutil import which
+from urllib.parse import unquote
+
+
+def fail(message: str) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def normalize_env_value(value: str) -> str:
+    normalized = value.strip()
+    if len(normalized) >= 2 and (
+        (normalized.startswith("'") and normalized.endswith("'"))
+        or (normalized.startswith('"') and normalized.endswith('"'))
+    ):
+        return normalized[1:-1]
+    return normalized
+
+
+def read_database_url(env_path: Path) -> str:
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "DATABASE_URL":
+            database_url = normalize_env_value(value)
+            if database_url:
+                return database_url
+    fail(f"DATABASE_URL is missing in {env_path}")
+
+
+def resolve_windows_host_path(raw_path: str) -> Path:
+    normalized = raw_path.replace("\\", "/")
+    if os.name == "nt":
+        return Path(normalized)
+
+    for tool in ("wslpath", "cygpath"):
+        if not which(tool):
+            continue
+        try:
+            converted = subprocess.check_output(
+                [tool, "-u", normalized],
+                text=True,
+            ).strip()
+        except Exception:
+            continue
+        if converted:
+            return Path(converted)
+
+    drive = normalized[0].lower()
+    tail = normalized[2:].lstrip("/")
+    fallback = Path(f"/mnt/{drive}") / tail
+    if fallback.exists():
+        return fallback
+    alt = Path(f"/{drive}") / tail
+    if alt.exists():
+        return alt
+    return fallback
+
+
+def resolve_sqlite_path(project_root: Path, database_url: str) -> Path:
+    prefixes = ("sqlite+aiosqlite:///", "sqlite:///")
+    prefix = next((item for item in prefixes if database_url.startswith(item)), None)
+    if prefix is None:
+        fail("DATABASE_URL must start with 'sqlite+aiosqlite:///' or 'sqlite:///'")
+    raw_path = database_url[len(prefix):].strip()
+    raw_path = raw_path.split("?", 1)[0].split("#", 1)[0].strip()
+    raw_path = unquote(raw_path)
+    if not raw_path:
+        fail("DATABASE_URL does not contain a valid sqlite file path")
+    if re.match(r"^[A-Za-z]:[/\\]", raw_path):
+        return resolve_windows_host_path(raw_path)
+    sqlite_path = Path(raw_path)
+    if not sqlite_path.is_absolute():
+        sqlite_path = project_root / sqlite_path
+    return sqlite_path
+
+
+project_root = Path(os.environ["MEMORY_PALACE_PROJECT_ROOT"])
+env_file = Path(os.environ["MEMORY_PALACE_BACKUP_ENV_FILE"])
+output_dir = Path(os.environ["MEMORY_PALACE_BACKUP_OUTPUT_DIR"])
+keep_count = int(os.environ["MEMORY_PALACE_BACKUP_KEEP_COUNT"])
+
+database_url = read_database_url(env_file)
+sqlite_path = resolve_sqlite_path(project_root, database_url)
+if not sqlite_path.exists():
+    fail(f"SQLite database file not found: {sqlite_path}")
+
+output_dir.mkdir(parents=True, exist_ok=True)
+timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+dest_file = output_dir / f"memory_palace_backup_{timestamp}.db"
+
+try:
+    with sqlite3.connect(sqlite_path, timeout=30.0) as source_conn:
+        source_conn.execute("PRAGMA busy_timeout = 30000")
+        with sqlite3.connect(dest_file, timeout=30.0) as target_conn:
+            target_conn.execute("PRAGMA busy_timeout = 30000")
+            source_conn.backup(target_conn, pages=256, sleep=0.05)
+except (OSError, sqlite3.Error) as exc:
+    try:
+        dest_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+    fail(f"SQLite backup failed: {exc}")
+
+print("Backup completed.")
+print(f"Source: {sqlite_path}")
+print(f"Target: {dest_file}")
+
+if keep_count > 0:
+    backups = sorted(output_dir.glob("memory_palace_backup_*.db"))
+    stale_backups = backups[:-keep_count]
+    for stale_backup in stale_backups:
+        try:
+            stale_backup.unlink()
+        except OSError:
+            pass
+    print(
+        f"Rotation: kept {min(len(backups), keep_count)} backup(s), removed {len(stale_backups)}."
+    )
+PY

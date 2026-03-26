@@ -1,0 +1,51 @@
+{
+  "routing_rules": [
+    {
+      "from": "evaluator",
+      "to": "analyzer",
+      "condition": "score_below_threshold",
+      "description": "评分低于阈值（总分 < 35/50）时，将评分报告和问题清单转发给 analyzer"
+    },
+    {
+      "from": "analyzer",
+      "to": "prompt_optimizer",
+      "condition": "root_cause_prompt",
+      "description": "根因类型为 prompt 时，路由给 prompt_optimizer"
+    },
+    {
+      "from": "analyzer",
+      "to": "memory_optimizer",
+      "condition": "root_cause_memory",
+      "description": "根因类型为 memory 时，路由给 memory_optimizer"
+    },
+    {
+      "from": "analyzer",
+      "to": "prompt_optimizer",
+      "condition": "root_cause_coordination",
+      "description": "根因类型为 coordination 时，归入 prompt 优化（修改 primary 提示词）"
+    },
+    {
+      "from": "prompt_optimizer",
+      "to": "evaluator",
+      "condition": "optimization_done",
+      "description": "提示词优化完成后，通知 evaluator 触发下一轮评测"
+    },
+    {
+      "from": "memory_optimizer",
+      "to": "evaluator",
+      "condition": "optimization_done",
+      "description": "记忆优化完成后，通知 evaluator 触发下一轮评测"
+    }
+  ],
+  "loop": {
+    "entry": "evaluator",
+    "path": "evaluator → analyzer → [prompt_optimizer | memory_optimizer] → evaluator",
+    "type": "single_direction"
+  },
+  "constraints": {
+    "evaluator": { "direct_user_reply": false },
+    "analyzer": { "direct_user_reply": false },
+    "prompt_optimizer": { "direct_user_reply": false },
+    "memory_optimizer": { "direct_user_reply": false }
+  }
+}

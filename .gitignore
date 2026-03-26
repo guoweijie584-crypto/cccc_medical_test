@@ -1,0 +1,75 @@
+# Python caches and virtualenvs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local env and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+config/runtime_llm.json
+config/cccc_native/actor_llm_config.json
+config/cccc_native/bootstrap_state.json
+
+# CCCC runtime state and local bootstrap homes
+.cccc_home/
+.cccc_data/
+.cccc_eval_scope/
+.cccc_home_bootstrap_test/
+.cccc_home_bootstrap_test2/
+.cccc_home_bootstrap_test3/
+
+# Logs and transient runtime artifacts
+logs/
+tmp_atomic_repro.json
+nul
+
+# Frontend local dependencies/build output
+cccc_medical-main/web/node_modules/
+cccc_medical-main/web/dist/
+cccc_medical-main/web/.vite/
+
+# Generated test/evaluation output
+tests/output/
+tests/phase1_acceptance_report.json
+tests/phase1_acceptance_report.md
+
+# Generated visualization/cache output
+data/visualization/
+
+# Local medical datasets (do not publish)
+data/patient_structured/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Additional local/generated artifacts
+*.log
+*.pid
+*.seed
+*.out
+*.err
+*.tmp
+*.bak
+
+# Local snapshots and runtime dumps (sensitive/large)
+Memory-Palace-main/snapshots/
+cccc_medical-main/src/cccc/ports/web/dist/
+
+# Nested repo / accidental imports
+**/.git/
+
+# Optional: large local datasets (keep only if intentionally public)
+Memory-Palace-main/backend/tests/datasets/raw/
+Memory-Palace-main/backend/tests/datasets/processed/

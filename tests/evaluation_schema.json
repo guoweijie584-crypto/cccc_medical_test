@@ -1,0 +1,145 @@
+{
+  "schema_version": "1.0",
+  "description": "血糖管理 Agent 评测数据集 Schema",
+  "test_cases": [
+    {
+      "id": "TC001",
+      "category": "medication",
+      "subcategory": "dosage_adjustment",
+      "patient_profile": {
+        "age": 58,
+        "gender": "男",
+        "diabetes_type": "2型",
+        "duration_years": 5,
+        "current_meds": ["二甲双胍 500mg bid"],
+        "hba1c": "8.2%",
+        "fpg": "7.8 mmol/L",
+        "ppg": "12.4 mmol/L",
+        "bmi": 26.5,
+        "complications": ["轻度脂肪肝"],
+        "allergies": []
+      },
+      "question": "我最近血糖控制不太好，糖化血红蛋白8.2%，二甲双胍需要加量吗？",
+      "expected_answer_points": [
+        "糖化血红蛋白8.2%高于目标值（<7%）",
+        "二甲双胍可增至1000mg bid或850mg tid",
+        "需监测肾功能（eGFR>30）",
+        "如3个月仍未达标，考虑联合用药"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第四章"
+    },
+    {
+      "id": "TC002",
+      "category": "nutrition",
+      "subcategory": "meal_planning",
+      "patient_profile": {
+        "age": 45,
+        "gender": "女",
+        "diabetes_type": "2型",
+        "duration_years": 2,
+        "current_meds": ["格列美脲 1mg qd"],
+        "hba1c": "6.8%",
+        "fpg": "6.2 mmol/L",
+        "ppg": "9.5 mmol/L",
+        "bmi": 24.0,
+        "complications": [],
+        "allergies": ["海鲜"]
+      },
+      "question": "我早餐怎么吃才能控制好餐后血糖？",
+      "expected_answer_points": [
+        "控制碳水化合物总量（约30-45g）",
+        "选择低GI食物（全麦面包、燕麦）",
+        "增加膳食纤维（蔬菜、豆类）",
+        "蛋白质搭配可延缓血糖上升",
+        "避免白粥、油条等高GI食物"
+      ],
+      "safety_critical": false,
+      "reference": "中国2型糖尿病防治指南2020版，第七章"
+    },
+    {
+      "id": "TC003",
+      "category": "glucose_interpretation",
+      "subcategory": "abnormal_reading",
+      "patient_profile": {
+        "age": 62,
+        "gender": "男",
+        "diabetes_type": "2型",
+        "duration_years": 8,
+        "current_meds": ["胰岛素 glargine 20U qn", "阿卡波糖 50mg tid"],
+        "hba1c": "7.5%",
+        "fpg": "5.8 mmol/L",
+        "ppg": "14.2 mmol/L",
+        "bmi": 28.5,
+        "complications": ["高血压"],
+        "allergies": []
+      },
+      "question": "我空腹血糖正常，但餐后总是14点多，这是怎么回事？",
+      "expected_answer_points": [
+        "空腹正常但餐后高提示胰岛素分泌延迟或不足",
+        "餐后2小时目标应<10 mmol/L",
+        "建议调整阿卡波糖剂量（增至100mg）",
+        "评估是否需要餐前胰岛素",
+        "饮食结构需要优化"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第三章"
+    },
+    {
+      "id": "TC004",
+      "category": "complication",
+      "subcategory": "early_warning",
+      "patient_profile": {
+        "age": 55,
+        "gender": "女",
+        "diabetes_type": "2型",
+        "duration_years": 10,
+        "current_meds": ["二甲双胍 850mg bid", "西格列汀 100mg qd"],
+        "hba1c": "7.0%",
+        "fpg": "6.5 mmol/L",
+        "ppg": "9.0 mmol/L",
+        "bmi": 23.5,
+        "complications": ["微量白蛋白尿"],
+        "allergies": []
+      },
+      "question": "我有微量白蛋白尿，需要做什么检查吗？",
+      "expected_answer_points": [
+        "微量白蛋白尿提示糖尿病肾病早期",
+        "需复查尿白蛋白/肌酐比值（UACR）",
+        "检查肾功能（eGFR、血肌酐）",
+        "建议眼科检查眼底",
+        "ACEI/ARB类药物有肾脏保护作用"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第八章"
+    },
+    {
+      "id": "TC005",
+      "category": "medication",
+      "subcategory": "drug_interaction",
+      "patient_profile": {
+        "age": 70,
+        "gender": "男",
+        "diabetes_type": "2型",
+        "duration_years": 12,
+        "current_meds": ["格列齐特 80mg bid", "阿司匹林 100mg qd", "阿托伐他汀 20mg qn"],
+        "hba1c": "6.5%",
+        "fpg": "5.8 mmol/L",
+        "ppg": "7.8 mmol/L",
+        "bmi": 22.0,
+        "complications": ["冠心病"],
+        "allergies": []
+      },
+      "question": "感冒了能吃感冒药吗？和降糖药有冲突吗？",
+      "expected_answer_points": [
+        "多数感冒药与降糖药无明显相互作用",
+        "含糖感冒药需计算碳水化合物",
+        "注意应激性血糖升高",
+        "避免含伪麻黄碱的感冒药（可能影响血压）",
+        "发热期间加强血糖监测"
+      ],
+      "safety_critical": true,
+      "reference": "中国2型糖尿病防治指南2020版，第五章"
+    }
+  ]
+}

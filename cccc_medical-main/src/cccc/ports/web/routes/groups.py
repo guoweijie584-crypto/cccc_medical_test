@@ -1,0 +1,1602 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import mimetypes
+from pathlib import Path
+import time
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, StreamingResponse
+
+from ....contracts.v1.automation import AutomationRuleSet
+from ....daemon.server import get_daemon_endpoint
+from ....daemon.group.presentation_ops import load_presentation_snapshot, resolve_workspace_asset_path
+from ....kernel.blobs import resolve_blob_attachment_path, store_blob_bytes
+from ....kernel.group import load_group
+from ....kernel.group_template import parse_group_template
+from ....kernel.ledger import read_last_lines
+from ....kernel.prompt_files import (
+    DEFAULT_PREAMBLE_BODY,
+    HELP_FILENAME,
+    PREAMBLE_FILENAME,
+    delete_group_prompt_file,
+    load_builtin_help_markdown,
+    read_group_prompt_file,
+    resolve_active_scope_root,
+    write_group_prompt_file,
+)
+from ....kernel.access_tokens import list_access_tokens
+from ....util.conv import coerce_bool
+from ....util.fs import atomic_write_text
+from ..schemas import (
+    AttachRequest,
+    CreateGroupRequest,
+    GroupAutomationManageRequest,
+    GroupAutomationRequest,
+    GroupAutomationResetBaselineRequest,
+    GroupPresentationBrowserSessionRequest,
+    GroupPresentationClearRequest,
+    GroupPresentationPublishRequest,
+    GroupPresentationPublishWorkspaceRequest,
+    GroupSettingsRequest,
+    GroupTemplatePreviewRequest,
+    GroupUpdateRequest,
+    ProjectMdUpdateRequest,
+    RepoPromptUpdateRequest,
+    RouteContext,
+    WEB_MAX_TEMPLATE_BYTES,
+    WEB_MAX_FILE_BYTES,
+    _safe_int,
+    check_group,
+    filter_groups_for_principal,
+    require_admin,
+    require_group,
+    require_user,
+    resolve_websocket_principal,
+    websocket_tokens_active,
+)
+
+_PRESENTATION_BROWSER_STREAM_LIMIT_BYTES = 16 * 1024 * 1024
+
+
+def create_routers(ctx: RouteContext) -> list[APIRouter]:
+    # --- global router (user/admin scope, per-route guard where needed) ---
+    global_router = APIRouter(prefix="/api/v1")
+
+    # --- group-scoped router ---
+    group_router = APIRouter(prefix="/api/v1/groups/{group_id}", dependencies=[Depends(require_group)])
+    context_inflight: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
+    context_generation: Dict[str, int] = {}
+    context_lock = asyncio.Lock()
+
+    def _context_cache_key(group_id: str, detail: str) -> str:
+        gid = str(group_id or "").strip()
+        mode = str(detail or "summary").strip().lower() or "summary"
+        return f"context:{gid}:{mode}"
+
+    async def _invalidate_context_read(group_id: str) -> None:
+        gid = str(group_id or "").strip()
+        if not gid:
+            return
+        async with context_lock:
+            prefix = f"context:{gid}:"
+            touched = False
+            for key in list(context_generation.keys()):
+                if key.startswith(prefix):
+                    context_generation[key] = int(context_generation.get(key, 0)) + 1
+                    touched = True
+            for key in list(context_inflight.keys()):
+                if key.startswith(prefix):
+                    context_inflight.pop(key, None)
+                    touched = True
+            if not touched:
+                context_generation[_context_cache_key(gid, "summary")] = 1
+                context_generation[_context_cache_key(gid, "full")] = 1
+
+    async def _deduped_context_get(group_id: str, detail: str, fetcher) -> Dict[str, Any]:  # type: ignore[no-untyped-def]
+        gid = str(group_id or "").strip()
+        if not gid:
+            return await fetcher()
+
+        key = _context_cache_key(gid, detail)
+        if ctx.read_only:
+            ttl = max(0.0, min(5.0, ctx.exhibit_cache_ttl_s))
+            return await ctx.cached_json(key, ttl, fetcher)
+
+        fut: asyncio.Future[Dict[str, Any]] | None = None
+        fetch_generation = 0
+        do_fetch = False
+
+        async with context_lock:
+            fut = context_inflight.get(key)
+            if fut is None or fut.done():
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                context_inflight[key] = fut
+                fetch_generation = int(context_generation.get(key, 0))
+                do_fetch = True
+
+        if fut is not None and not do_fetch:
+            return await fut
+
+        try:
+            val = await fetcher()
+            async with context_lock:
+                if int(context_generation.get(key, 0)) == fetch_generation and context_inflight.get(key) is fut:
+                    if fut is not None and not fut.done():
+                        fut.set_result(val)
+                elif fut is not None and not fut.done():
+                    fut.set_result(val)
+            return val
+        except Exception as exc:
+            async with context_lock:
+                if fut is not None and not fut.done():
+                    fut.set_exception(exc)
+            raise
+        finally:
+            async with context_lock:
+                if context_inflight.get(key) is fut:
+                    context_inflight.pop(key, None)
+
+    def _request_access_token(request: Request) -> str:
+        auth = str(request.headers.get("authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return str(auth[7:] or "").strip()
+        cookie_token = str(request.cookies.get("cccc_access_token") or "").strip()
+        if cookie_token:
+            return cookie_token
+        return str(request.query_params.get("token") or "").strip()
+
+    def _presentation_card_type_for_url(url: str) -> str:
+        suffix = Path(urlparse(str(url or "").strip()).path or "").suffix.lower()
+        if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}:
+            return "image"
+        if suffix == ".pdf":
+            return "pdf"
+        return "web_preview"
+
+    def _presentation_card_type_for_upload(filename: str, content_type: str) -> str:
+        suffix = Path(str(filename or "").strip()).suffix.lower()
+        mime = str(content_type or "").strip().lower()
+        if suffix in {".md", ".markdown"} or mime in {"text/markdown", "text/x-markdown"}:
+            return "markdown"
+        if suffix in {".html", ".htm"} or mime == "text/html":
+            return "web_preview"
+        if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"} or mime.startswith("image/"):
+            return "image"
+        if suffix == ".pdf" or mime == "application/pdf":
+            return "pdf"
+        return "file"
+
+    def _normalize_presentation_slot(value: str) -> str:
+        normalized = str(value or "auto").strip().lower().replace("_", "-") or "auto"
+        if normalized in {"auto", "slot-1", "slot-2", "slot-3", "slot-4"}:
+            return normalized
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_slot", "message": "slot must be auto or one of: slot-1, slot-2, slot-3, slot-4"},
+        )
+
+    def _presentation_workspace_root(group_id: str) -> Path:
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+        root = resolve_active_scope_root(group)
+        if root is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "presentation_workspace_missing_scope", "message": "group has no active scope"},
+            )
+        return root
+
+    def _resolve_presentation_workspace_dir(group_id: str, raw_path: str) -> tuple[Path, Path]:
+        root = _presentation_workspace_root(group_id)
+        path_text = str(raw_path or "").strip().replace("\\", "/")
+        target = root if not path_text else (root / Path(*Path(path_text).parts)).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "presentation_workspace_out_of_scope",
+                    "message": "path must stay under the group's active scope root",
+                },
+            ) from exc
+        if not target.exists():
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "presentation_workspace_not_found", "message": f"path not found: {path_text or '.'}"},
+            )
+        if not target.is_dir():
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "presentation_workspace_not_dir", "message": f"not a directory: {path_text or '.'}"},
+            )
+        return root, target
+
+    def _presentation_workspace_relpath(root: Path, path: Path) -> str:
+        rel = path.relative_to(root)
+        rel_text = rel.as_posix()
+        return "" if rel_text == "." else rel_text
+
+    # ------------------------------------------------------------------ #
+    # Global routes
+    # ------------------------------------------------------------------ #
+
+    @global_router.get("/groups")
+    async def groups(request: Request) -> Dict[str, Any]:
+        async def _fetch() -> Dict[str, Any]:
+            return await ctx.daemon({"op": "groups"})
+
+        ttl = max(0.0, min(5.0, ctx.exhibit_cache_ttl_s))
+        resp = await ctx.cached_json("groups", ttl, _fetch)
+        result = resp.get("result") if isinstance(resp, dict) else None
+        groups_list = result.get("groups") if isinstance(result, dict) else None
+        if isinstance(groups_list, list):
+            resp = dict(resp)
+            out = dict(result)
+            out["groups"] = filter_groups_for_principal(request, groups_list)
+            resp["result"] = out
+        return resp
+
+    @global_router.post("/groups", dependencies=[Depends(require_admin)])
+    async def group_create(req: CreateGroupRequest) -> Dict[str, Any]:
+        return await ctx.daemon({"op": "group_create", "args": {"title": req.title, "topic": req.topic, "by": req.by}})
+
+    @global_router.post("/groups/from_template", dependencies=[Depends(require_admin)])
+    async def group_create_from_template(
+        path: str = Form(...),
+        title: str = Form("working-group"),
+        topic: str = Form(""),
+        by: str = Form("user"),
+        file: UploadFile = File(...),
+    ) -> Dict[str, Any]:
+        raw = await file.read()
+        if len(raw) > WEB_MAX_TEMPLATE_BYTES:
+            raise HTTPException(status_code=413, detail={"code": "template_too_large", "message": "template too large"})
+        template_text = raw.decode("utf-8", errors="replace")
+        return await ctx.daemon(
+            {
+                "op": "group_create_from_template",
+                "args": {"path": path, "title": title, "topic": topic, "by": by, "template": template_text},
+            }
+        )
+
+    @global_router.post("/templates/preview", dependencies=[Depends(require_admin)])
+    async def template_preview(file: UploadFile = File(...)) -> Dict[str, Any]:
+        raw = await file.read()
+        if len(raw) > WEB_MAX_TEMPLATE_BYTES:
+            return {"ok": False, "error": {"code": "template_too_large", "message": "template too large"}}
+        template_text = raw.decode("utf-8", errors="replace")
+        try:
+            tpl = parse_group_template(template_text)
+        except Exception as e:
+            return {"ok": False, "error": {"code": "invalid_template", "message": str(e)}}
+
+        def _prompt_preview(value: Any, limit: int = 2000) -> Dict[str, Any]:
+            if value is None:
+                return {"source": "builtin"}
+            raw_text = str(value)
+            if not raw_text.strip():
+                return {"source": "builtin"}
+            out = raw_text.strip()
+            if len(out) > limit:
+                out = out[:limit] + "\n…"
+            # Templates now map prompt overrides to CCCC_HOME/group prompts.
+            return {"source": "home", "chars": len(raw_text), "preview": out}
+
+        return {
+            "ok": True,
+            "result": {
+                "template": {
+                    "kind": tpl.kind,
+                    "v": tpl.v,
+                    "title": tpl.title,
+                    "topic": tpl.topic,
+                    "exported_at": tpl.exported_at,
+                    "cccc_version": tpl.cccc_version,
+                    "actors": [
+                        {
+                            "id": a.actor_id,
+                            "title": a.title,
+                            "runtime": a.runtime,
+                            "runner": a.runner,
+                            "command": a.command,
+                            "submit": a.submit,
+                            "enabled": bool(a.enabled),
+                        }
+                        for a in tpl.actors
+                    ],
+                    "settings": tpl.settings.model_dump(),
+                    "automation": {
+                        "rules": len(tpl.automation.rules),
+                        "snippets": len(tpl.automation.snippets),
+                    },
+                    "prompts": {
+                        "preamble": _prompt_preview(tpl.prompts.preamble),
+                        "help": _prompt_preview(tpl.prompts.help),
+                    },
+                }
+            },
+        }
+
+    @global_router.get("/events/stream", dependencies=[Depends(require_user)])
+    async def global_events_stream() -> StreamingResponse:
+        """SSE stream for global events (group created/deleted, etc.)."""
+        from ..streams import sse_global_events_tail, create_sse_response
+        return create_sse_response(sse_global_events_tail(ctx.home))
+
+    # ------------------------------------------------------------------ #
+    # Group-scoped routes
+    # ------------------------------------------------------------------ #
+
+    @group_router.get("")
+    async def group_show(group_id: str) -> Dict[str, Any]:
+        gid = str(group_id or "").strip()
+
+        async def _fetch() -> Dict[str, Any]:
+            return await ctx.daemon({"op": "group_show", "args": {"group_id": gid}})
+
+        ttl = max(0.0, min(5.0, ctx.exhibit_cache_ttl_s))
+        return await ctx.cached_json(f"group:{gid}", ttl, _fetch)
+
+    @group_router.put("")
+    async def group_update(group_id: str, req: GroupUpdateRequest) -> Dict[str, Any]:
+        """Update group metadata (title/topic)."""
+        patch: Dict[str, Any] = {}
+        if req.title is not None:
+            patch["title"] = req.title
+        if req.topic is not None:
+            patch["topic"] = req.topic
+        if not patch:
+            return {"ok": True, "result": {"message": "no changes"}}
+        return await ctx.daemon({"op": "group_update", "args": {"group_id": group_id, "by": req.by, "patch": patch}})
+
+    @group_router.delete("")
+    async def group_delete(request: Request, group_id: str, confirm: str = "", by: str = "user") -> Dict[str, Any]:
+        """Delete a group (admin-only, requires confirm=group_id)."""
+        require_admin(request)
+        if confirm != group_id:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "confirmation_required", "message": f"confirm must equal group_id: {group_id}"}
+            )
+        return await ctx.daemon({"op": "group_delete", "args": {"group_id": group_id, "by": by}})
+
+    @group_router.get("/context")
+    async def group_context(group_id: str, fresh: bool = False, detail: str = "summary") -> Dict[str, Any]:
+        """Get a group context view (summary by default, full when requested)."""
+        gid = str(group_id or "").strip()
+        detail_mode = str(detail or "summary").strip().lower() or "summary"
+        if detail_mode not in {"summary", "full"}:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_detail",
+                    "message": "detail must be 'summary' or 'full'",
+                    "details": {"detail": detail_mode},
+                },
+            )
+
+        async def _fetch() -> Dict[str, Any]:
+            return await ctx.daemon({"op": "context_get", "args": {"group_id": gid, "detail": detail_mode}})
+
+        if fresh:
+            await _invalidate_context_read(gid)
+            return await _fetch()
+        return await _deduped_context_get(gid, detail_mode, _fetch)
+
+    @group_router.get("/template/export")
+    async def group_template_export(group_id: str) -> Dict[str, Any]:
+        return await ctx.daemon({"op": "group_template_export", "args": {"group_id": group_id}})
+
+    @group_router.post("/template/preview")
+    async def group_template_preview(group_id: str, req: GroupTemplatePreviewRequest) -> Dict[str, Any]:
+        return await ctx.daemon({"op": "group_template_preview", "args": {"group_id": group_id, "template": req.template, "by": req.by}})
+
+    @group_router.post("/template/preview_upload")
+    async def group_template_preview_upload(
+        group_id: str,
+        by: str = Form("user"),
+        file: UploadFile = File(...),
+    ) -> Dict[str, Any]:
+        raw = await file.read()
+        if len(raw) > WEB_MAX_TEMPLATE_BYTES:
+            raise HTTPException(status_code=413, detail={"code": "template_too_large", "message": "template too large"})
+        template_text = raw.decode("utf-8", errors="replace")
+        return await ctx.daemon({"op": "group_template_preview", "args": {"group_id": group_id, "template": template_text, "by": by}})
+
+    @group_router.post("/template/import_replace")
+    async def group_template_import_replace(
+        group_id: str,
+        confirm: str = Form(""),
+        by: str = Form("user"),
+        file: UploadFile = File(...),
+    ) -> Dict[str, Any]:
+        raw = await file.read()
+        if len(raw) > WEB_MAX_TEMPLATE_BYTES:
+            raise HTTPException(status_code=413, detail={"code": "template_too_large", "message": "template too large"})
+        template_text = raw.decode("utf-8", errors="replace")
+        return await ctx.daemon(
+            {
+                "op": "group_template_import_replace",
+                "args": {"group_id": group_id, "confirm": confirm, "by": by, "template": template_text},
+            }
+        )
+
+    @group_router.get("/tasks")
+    async def group_tasks(group_id: str, task_id: Optional[str] = None) -> Dict[str, Any]:
+        """List tasks (or fetch a single task when task_id is provided)."""
+        args: Dict[str, Any] = {"group_id": group_id}
+        if task_id:
+            args["task_id"] = task_id
+        return await ctx.daemon({"op": "task_list", "args": args})
+
+    @group_router.get("/presentation")
+    async def group_presentation_get(group_id: str) -> Dict[str, Any]:
+        return await ctx.daemon({"op": "presentation_get", "args": {"group_id": group_id}})
+
+    @group_router.post("/presentation/publish")
+    async def group_presentation_publish(group_id: str, req: GroupPresentationPublishRequest) -> Dict[str, Any]:
+        url = str(req.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail={"code": "missing_url", "message": "missing url"})
+        slot = _normalize_presentation_slot(req.slot)
+        return await ctx.daemon(
+            {
+                "op": "presentation_publish",
+                "args": {
+                    "group_id": group_id,
+                    "by": req.by,
+                    "slot": slot,
+                    "card_type": _presentation_card_type_for_url(url),
+                    "title": req.title,
+                    "summary": req.summary,
+                    "url": url,
+                },
+            }
+        )
+
+    @group_router.get("/presentation/workspace/list")
+    async def group_presentation_workspace_list(group_id: str, path: str = "") -> Dict[str, Any]:
+        root, target = _resolve_presentation_workspace_dir(group_id, path)
+        items = []
+        try:
+            for entry in sorted(target.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
+                if entry.name.startswith("."):
+                    continue
+                rel_path = _presentation_workspace_relpath(root, entry)
+                items.append(
+                    {
+                        "name": entry.name,
+                        "path": rel_path,
+                        "is_dir": entry.is_dir(),
+                        "mime_type": (str(mimetypes.guess_type(entry.name)[0] or "") if entry.is_file() else ""),
+                    }
+                )
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "presentation_workspace_permission_denied", "message": str(exc)},
+            ) from exc
+
+        current_path = _presentation_workspace_relpath(root, target)
+        parent_path = None
+        if target != root:
+            parent_path = _presentation_workspace_relpath(root, target.parent)
+        return {
+            "ok": True,
+            "result": {
+                "root_path": str(root),
+                "path": current_path,
+                "parent": parent_path,
+                "items": items[:200],
+            },
+        }
+
+    @group_router.post("/presentation/publish_workspace")
+    async def group_presentation_publish_workspace(
+        group_id: str, req: GroupPresentationPublishWorkspaceRequest
+    ) -> Dict[str, Any]:
+        path_text = str(req.path or "").strip()
+        if not path_text:
+            raise HTTPException(status_code=400, detail={"code": "missing_path", "message": "missing path"})
+        _resolve_presentation_workspace_dir(group_id, Path(path_text).parent.as_posix() if Path(path_text).parent.as_posix() != "." else "")
+        slot = _normalize_presentation_slot(req.slot)
+        return await ctx.daemon(
+            {
+                "op": "presentation_publish",
+                "args": {
+                    "group_id": group_id,
+                    "by": req.by,
+                    "slot": slot,
+                    "title": req.title,
+                    "summary": req.summary,
+                    "path": path_text,
+                },
+            }
+        )
+
+    @group_router.post("/presentation/publish_upload")
+    async def group_presentation_publish_upload(
+        group_id: str,
+        by: str = Form("user"),
+        slot: str = Form("auto"),
+        title: str = Form(""),
+        summary: str = Form(""),
+        file: UploadFile = File(...),
+    ) -> Dict[str, Any]:
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        raw = await file.read()
+        if len(raw) > WEB_MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail={"code": "file_too_large", "message": "file too large"})
+
+        normalized_slot = _normalize_presentation_slot(slot)
+        filename = str(getattr(file, "filename", "") or "file").strip() or "file"
+        content_type = str(getattr(file, "content_type", "") or "").strip()
+        card_type = _presentation_card_type_for_upload(filename, content_type)
+        resolved_title = str(title or "").strip() or filename
+        args: Dict[str, Any] = {
+            "group_id": group_id,
+            "by": str(by or "user").strip() or "user",
+            "slot": normalized_slot,
+            "card_type": card_type,
+            "title": resolved_title,
+            "summary": str(summary or "").strip(),
+            "source_label": filename,
+        }
+
+        if card_type == "markdown":
+            args["content"] = raw.decode("utf-8", errors="replace")
+            args["source_ref"] = filename
+        else:
+            stored = store_blob_bytes(
+                group,
+                data=raw,
+                filename=filename,
+                mime_type=content_type,
+            )
+            args["blob_rel_path"] = str(stored.get("path") or "")
+            args["source_ref"] = str(stored.get("path") or "")
+
+        return await ctx.daemon({"op": "presentation_publish", "args": args})
+
+    @group_router.post("/presentation/clear")
+    async def group_presentation_clear(group_id: str, req: GroupPresentationClearRequest) -> Dict[str, Any]:
+        return await ctx.daemon(
+            {
+                "op": "presentation_clear",
+                "args": {
+                    "group_id": group_id,
+                    "by": req.by,
+                    "slot": req.slot,
+                    "all": bool(req.all),
+                },
+            }
+        )
+
+    @group_router.get("/presentation/browser_surface/session")
+    async def group_presentation_browser_surface_info(group_id: str, slot: str = "") -> Dict[str, Any]:
+        return await ctx.daemon({"op": "presentation_browser_info", "args": {"group_id": group_id, "slot": slot}})
+
+    @group_router.post("/presentation/browser_surface/session")
+    async def group_presentation_browser_surface_open(
+        group_id: str, req: GroupPresentationBrowserSessionRequest
+    ) -> Dict[str, Any]:
+        url = str(req.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail={"code": "missing_url", "message": "missing url"})
+        width = _safe_int(req.width, default=1280, min_value=640, max_value=2560)
+        height = _safe_int(req.height, default=800, min_value=480, max_value=1600)
+        return await ctx.daemon(
+            {
+                "op": "presentation_browser_open",
+                "args": {
+                    "group_id": group_id,
+                    "slot": req.slot,
+                    "by": req.by,
+                    "url": url,
+                    "width": width,
+                    "height": height,
+                },
+            }
+        )
+
+    @group_router.post("/presentation/browser_surface/session/close")
+    async def group_presentation_browser_surface_close(
+        group_id: str, req: GroupPresentationBrowserSessionRequest
+    ) -> Dict[str, Any]:
+        return await ctx.daemon(
+            {
+                "op": "presentation_browser_close",
+                "args": {
+                    "group_id": group_id,
+                    "slot": req.slot,
+                    "by": req.by,
+                },
+            }
+        )
+
+    @group_router.get("/presentation/slots/{slot_id}/asset")
+    async def group_presentation_asset(group_id: str, slot_id: str, download: bool = False) -> FileResponse:
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        normalized_slot_id = str(slot_id or "").strip().lower().replace("_", "-")
+        if normalized_slot_id not in {"slot-1", "slot-2", "slot-3", "slot-4"}:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_slot", "message": "slot must be one of: slot-1, slot-2, slot-3, slot-4"},
+            )
+
+        snapshot = load_presentation_snapshot(group_id)
+        slot = next((item for item in snapshot.slots if str(item.slot_id or "") == normalized_slot_id), None)
+        card = slot.card if slot else None
+        workspace_rel_path = str((card.content.workspace_rel_path if card and card.content else "") or "").strip()
+        blob_rel_path = str((card.content.blob_rel_path if card and card.content else "") or "").strip()
+        if not card or (not blob_rel_path and not workspace_rel_path):
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "presentation_asset_not_found", "message": f"presentation slot has no local asset: {normalized_slot_id}"},
+            )
+
+        abs_path: Path
+        if workspace_rel_path:
+            try:
+                abs_path = resolve_workspace_asset_path(group, workspace_rel_path)
+            except FileNotFoundError:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "workspace_file_not_found", "message": f"workspace file not found: {workspace_rel_path}"},
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "workspace_file_invalid", "message": str(exc)},
+                ) from exc
+        else:
+            try:
+                abs_path = resolve_blob_attachment_path(group, rel_path=blob_rel_path)
+            except FileNotFoundError:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "blob_not_found", "message": f"blob not found: {blob_rel_path}"},
+                )
+
+        media_type = str(card.content.mime_type or "").strip()
+        if not media_type:
+            media_type = str(mimetypes.guess_type(abs_path.name)[0] or "application/octet-stream")
+        filename = str(card.content.file_name or card.source_label or abs_path.name).strip() or abs_path.name
+        response = FileResponse(
+            path=abs_path,
+            media_type=media_type,
+            filename=filename,
+            content_disposition_type="attachment" if download else "inline",
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @group_router.get("/project_md")
+    async def project_md_get(group_id: str) -> Dict[str, Any]:
+        """Get PROJECT.md content for the group's active scope root (repo root)."""
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        scopes = group.doc.get("scopes") if isinstance(group.doc.get("scopes"), list) else []
+        active_scope_key = str(group.doc.get("active_scope_key") or "")
+
+        project_root: Optional[str] = None
+        for sc in scopes:
+            if not isinstance(sc, dict):
+                continue
+            sk = str(sc.get("scope_key") or "")
+            if sk == active_scope_key:
+                project_root = str(sc.get("url") or "")
+                break
+        if not project_root:
+            if scopes and isinstance(scopes[0], dict):
+                project_root = str(scopes[0].get("url") or "")
+        if not project_root:
+            return {"ok": True, "result": {"found": False, "path": None, "content": None, "error": "No scope attached to group. Use 'cccc attach <path>' first."}}
+
+        root = Path(project_root).expanduser()
+        if not root.exists() or not root.is_dir():
+            return {"ok": True, "result": {"found": False, "path": str(root / "PROJECT.md"), "content": None, "error": f"Project root does not exist: {root}"}}
+
+        project_md_path = root / "PROJECT.md"
+        if not project_md_path.exists():
+            project_md_path_lower = root / "project.md"
+            if project_md_path_lower.exists():
+                project_md_path = project_md_path_lower
+            else:
+                return {"ok": True, "result": {"found": False, "path": str(project_md_path), "content": None, "error": f"PROJECT.md not found at {project_md_path}"}}
+
+        try:
+            content = project_md_path.read_text(encoding="utf-8", errors="replace")
+            return {"ok": True, "result": {"found": True, "path": str(project_md_path), "content": content}}
+        except Exception as e:
+            return {"ok": True, "result": {"found": False, "path": str(project_md_path), "content": None, "error": f"Failed to read PROJECT.md: {e}"}}
+
+    @group_router.put("/project_md")
+    async def project_md_put(group_id: str, req: ProjectMdUpdateRequest) -> Dict[str, Any]:
+        """Create or update PROJECT.md in the group's active scope root (repo root)."""
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        scopes = group.doc.get("scopes") if isinstance(group.doc.get("scopes"), list) else []
+        active_scope_key = str(group.doc.get("active_scope_key") or "")
+
+        project_root: Optional[str] = None
+        for sc in scopes:
+            if not isinstance(sc, dict):
+                continue
+            sk = str(sc.get("scope_key") or "")
+            if sk == active_scope_key:
+                project_root = str(sc.get("url") or "")
+                break
+        if not project_root:
+            if scopes and isinstance(scopes[0], dict):
+                project_root = str(scopes[0].get("url") or "")
+        if not project_root:
+            return {"ok": False, "error": {"code": "NO_SCOPE", "message": "No scope attached to group. Use 'cccc attach <path>' first."}}
+
+        root = Path(project_root).expanduser()
+        if not root.exists() or not root.is_dir():
+            return {"ok": False, "error": {"code": "INVALID_SCOPE", "message": f"Project root does not exist: {root}"}}
+
+        # Write to existing file if present; otherwise create PROJECT.md.
+        project_md_path = root / "PROJECT.md"
+        if not project_md_path.exists():
+            project_md_path_lower = root / "project.md"
+            if project_md_path_lower.exists():
+                project_md_path = project_md_path_lower
+
+        try:
+            atomic_write_text(project_md_path, str(req.content or ""), encoding="utf-8")
+            content = project_md_path.read_text(encoding="utf-8", errors="replace")
+            try:
+                await _invalidate_context_read(group_id)
+                await ctx.daemon({
+                    "op": "context_sync",
+                    "args": {
+                        "group_id": group_id,
+                        "by": "user",
+                        "ops": [{"op": "coordination.brief.update", "project_brief_stale": True}],
+                    },
+                })
+            except Exception:
+                pass
+            return {"ok": True, "result": {"found": True, "path": str(project_md_path), "content": content}}
+        except Exception as e:
+            return {"ok": False, "error": {"code": "WRITE_FAILED", "message": f"Failed to write PROJECT.md: {e}"}}
+
+    def _prompt_kind_to_filename(kind: str) -> str:
+        k = str(kind or "").strip().lower()
+        if k == "preamble":
+            return PREAMBLE_FILENAME
+        if k == "help":
+            return HELP_FILENAME
+        raise HTTPException(status_code=400, detail={"code": "invalid_kind", "message": f"unknown prompt kind: {kind}"})
+
+    def _builtin_prompt_markdown(kind: str) -> str:
+        k = str(kind or "").strip().lower()
+        if k == "preamble":
+            return str(DEFAULT_PREAMBLE_BODY or "").strip()
+        if k == "help":
+            return str(load_builtin_help_markdown() or "").strip()
+        return ""
+
+    def _normalize_help_changed_blocks(raw: Any) -> list[str]:
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            value = str(item or "").strip()
+            if not value or value in seen:
+                continue
+            if value == "common":
+                seen.add(value)
+                out.append(value)
+                continue
+            if value in ("role:foreman", "role:peer"):
+                seen.add(value)
+                out.append(value)
+                continue
+            if value.startswith("actor:"):
+                actor_id = str(value[len("actor:"):]).strip()
+                if actor_id:
+                    normalized = f"actor:{actor_id}"
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        out.append(normalized)
+        return out
+
+    async def _list_running_actor_views(group_id: str) -> list[dict[str, Any]]:
+        try:
+            resp = await ctx.daemon({"op": "actor_list", "args": {"group_id": group_id, "include_unread": False}})
+        except Exception:
+            return []
+        result = resp.get("result") if isinstance(resp, dict) else None
+        actors = result.get("actors") if isinstance(result, dict) else None
+        if not isinstance(actors, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for item in actors:
+            if not isinstance(item, dict):
+                continue
+            aid = str(item.get("id") or "").strip()
+            if not aid:
+                continue
+            if not coerce_bool(item.get("running"), default=False):
+                continue
+            out.append(item)
+        return out
+
+    def _help_update_reason_labels(*, actor: dict[str, Any], changed_blocks: list[str], editor_mode: str) -> list[str]:
+        mode = str(editor_mode or "").strip().lower()
+        if mode != "structured":
+            return []
+        aid = str(actor.get("id") or "").strip()
+        role = str(actor.get("role") or "").strip().lower()
+        if not aid:
+            return []
+        labels: list[str] = []
+        seen: set[str] = set()
+
+        def _add(label: str) -> None:
+            if label and label not in seen:
+                seen.add(label)
+                labels.append(label)
+
+        blocks = list(changed_blocks or [])
+        if "common" in blocks:
+            _add("common guidance")
+        if "role:foreman" in blocks and role == "foreman":
+            _add("foreman notes")
+        if "role:peer" in blocks and role == "peer":
+            _add("peer notes")
+        if f"actor:{aid}" in blocks:
+            _add("your actor note")
+        return labels
+
+    def _help_update_notify_copy(*, labels: list[str]) -> tuple[str, str]:
+        reasons = [str(label or "").strip() for label in labels if str(label or "").strip()]
+        if not reasons:
+            return (
+                "Help updated",
+                "Group help changed. Run `cccc_help` now to refresh your effective playbook.",
+            )
+        if len(reasons) == 1:
+            title = f"Help updated: {reasons[0]}"
+        else:
+            title = "Help updated: multiple sections"
+        joined = ", ".join(reasons)
+        message = (
+            f"Updated: {joined}. Run `cccc_help` now to refresh your effective playbook; "
+            "then update `cccc_agent_state` if your plan changes."
+        )
+        return title, message
+
+    async def _notify_help_update(
+        group_id: str,
+        *,
+        by: str,
+        editor_mode: str,
+        changed_blocks: list[str],
+        content_changed: bool,
+    ) -> list[str]:
+        if not content_changed:
+            return []
+        running = await _list_running_actor_views(group_id)
+        if not running:
+            return []
+
+        target_reasons: dict[str, list[str]] = {}
+        for actor in running:
+            aid = str(actor.get("id") or "").strip()
+            if not aid:
+                continue
+            reasons = _help_update_reason_labels(
+                actor=actor,
+                changed_blocks=changed_blocks,
+                editor_mode=editor_mode,
+            )
+            if reasons:
+                target_reasons[aid] = reasons
+
+        if not target_reasons:
+            for actor in running:
+                aid = str(actor.get("id") or "").strip()
+                if aid:
+                    target_reasons[aid] = []
+
+        notified: list[str] = []
+        for aid in sorted(target_reasons.keys()):
+            title, message = _help_update_notify_copy(labels=target_reasons.get(aid) or [])
+            try:
+                resp = await ctx.daemon({
+                    "op": "system_notify",
+                    "args": {
+                        "group_id": group_id,
+                        "by": "system",
+                        "kind": "info",
+                        "priority": "normal",
+                        "title": title,
+                        "message": message,
+                        "target_actor_id": aid,
+                        "requires_ack": False,
+                    },
+                })
+                if isinstance(resp, dict) and resp.get("ok"):
+                    notified.append(aid)
+            except Exception:
+                continue
+        return notified
+
+    @group_router.get("/prompts")
+    async def prompts_get(group_id: str) -> Dict[str, Any]:
+        """Get effective group guidance markdown (preamble/help) and override status."""
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        def _one(kind: str) -> Dict[str, Any]:
+            filename = _prompt_kind_to_filename(kind)
+            pf = read_group_prompt_file(group, filename)
+            if pf.found and isinstance(pf.content, str) and pf.content.strip():
+                return {"kind": kind, "source": "home", "filename": filename, "path": pf.path, "content": str(pf.content)}
+            return {
+                "kind": kind,
+                "source": "builtin",
+                "filename": filename,
+                "path": pf.path,
+                "content": _builtin_prompt_markdown(kind),
+            }
+
+        return {
+            "ok": True,
+            "result": {
+                "preamble": _one("preamble"),
+                "help": _one("help"),
+            },
+        }
+
+    @group_router.put("/prompts/{kind}")
+    async def prompts_put(group_id: str, kind: str, req: RepoPromptUpdateRequest) -> Dict[str, Any]:
+        """Create or update a group prompt override file under CCCC_HOME."""
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        filename = _prompt_kind_to_filename(kind)
+        try:
+            current_pf = read_group_prompt_file(group, filename)
+            current_content = str(current_pf.content or "") if current_pf.found and isinstance(current_pf.content, str) else _builtin_prompt_markdown(kind)
+            raw = str(req.content or "")
+            editor_mode = str(req.editor_mode or "").strip().lower()
+            changed_blocks = _normalize_help_changed_blocks(req.changed_blocks)
+            content_changed = str(current_content) != str(raw if raw.strip() else _builtin_prompt_markdown(kind))
+            if not raw.strip():
+                pf = delete_group_prompt_file(group, filename)
+                notified = []
+                if str(kind).strip().lower() == "help":
+                    notified = await _notify_help_update(
+                        group_id,
+                        by=str(req.by or "user").strip() or "user",
+                        editor_mode="raw",
+                        changed_blocks=[],
+                        content_changed=content_changed,
+                    )
+                return {"ok": True, "result": {"kind": kind, "source": "builtin", "filename": filename, "path": pf.path, "content": _builtin_prompt_markdown(kind), "notified_actor_ids": notified}}
+            pf = write_group_prompt_file(group, filename, raw)
+            notified = []
+            if str(kind).strip().lower() == "help":
+                notified = await _notify_help_update(
+                    group_id,
+                    by=str(req.by or "user").strip() or "user",
+                    editor_mode=editor_mode,
+                    changed_blocks=changed_blocks,
+                    content_changed=content_changed,
+                )
+            return {"ok": True, "result": {"kind": kind, "source": "home", "filename": filename, "path": pf.path, "content": pf.content or "", "notified_actor_ids": notified}}
+        except Exception as e:
+            return {"ok": False, "error": {"code": "WRITE_FAILED", "message": f"Failed to write {filename}: {e}"}}
+
+    @group_router.delete("/prompts/{kind}")
+    async def prompts_delete(group_id: str, kind: str, confirm: str = "") -> Dict[str, Any]:
+        """Reset a group prompt override by deleting the CCCC_HOME file (requires confirm=kind)."""
+        if str(confirm or "").strip().lower() != str(kind or "").strip().lower():
+            raise HTTPException(status_code=400, detail={"code": "confirmation_required", "message": f"confirm must equal kind: {kind}"})
+
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        filename = _prompt_kind_to_filename(kind)
+        try:
+            current_pf = read_group_prompt_file(group, filename)
+            current_content = str(current_pf.content or "") if current_pf.found and isinstance(current_pf.content, str) else _builtin_prompt_markdown(kind)
+            next_content = _builtin_prompt_markdown(kind)
+            content_changed = str(current_content) != str(next_content)
+            pf = delete_group_prompt_file(group, filename)
+            notified = []
+            if str(kind).strip().lower() == "help":
+                notified = await _notify_help_update(
+                    group_id,
+                    by="user",
+                    editor_mode="raw",
+                    changed_blocks=[],
+                    content_changed=content_changed,
+                )
+            return {"ok": True, "result": {"kind": kind, "source": "builtin", "filename": filename, "path": pf.path, "content": _builtin_prompt_markdown(kind), "notified_actor_ids": notified}}
+        except Exception as e:
+            return {"ok": False, "error": {"code": "DELETE_FAILED", "message": f"Failed to delete {filename}: {e}"}}
+
+    @group_router.post("/context")
+    async def group_context_sync(group_id: str, request: Request) -> Dict[str, Any]:
+        """Update group context via batch operations (v3).
+
+        Body: {"ops": [{"op": "coordination.brief.update", ...}, ...], "by": "user"}
+
+        Supported ops:
+        - coordination.brief.update / coordination.note.add
+        - task.create/update/move/restore/delete
+        - agent_state.update/clear
+        - meta.merge (advanced, restricted keys)
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail={"code": "invalid_json", "message": "invalid JSON body"})
+
+        ops = body.get("ops") if isinstance(body.get("ops"), list) else []
+        by = str(body.get("by") or "user")
+        dry_run = coerce_bool(body.get("dry_run"), default=False)
+
+        await _invalidate_context_read(group_id)
+        return await ctx.daemon({
+            "op": "context_sync",
+            "args": {"group_id": group_id, "ops": ops, "by": by, "dry_run": dry_run}
+        })
+
+    @group_router.get("/settings")
+    async def group_settings_get(group_id: str) -> Dict[str, Any]:
+        """Get group-scoped automation + delivery settings."""
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        automation = group.doc.get("automation") if isinstance(group.doc.get("automation"), dict) else {}
+        delivery = group.doc.get("delivery") if isinstance(group.doc.get("delivery"), dict) else {}
+        features = group.doc.get("features") if isinstance(group.doc.get("features"), dict) else {}
+        from ....kernel.terminal_transcript import get_terminal_transcript_settings
+        from ....kernel.messaging import get_default_send_to
+
+        tt = get_terminal_transcript_settings(group.doc)
+        return {
+            "ok": True,
+            "result": {
+                "settings": {
+                    "default_send_to": get_default_send_to(group.doc),
+                    "nudge_after_seconds": _safe_int(automation.get("nudge_after_seconds", 300), default=300, min_value=0),
+                    "reply_required_nudge_after_seconds": _safe_int(automation.get("reply_required_nudge_after_seconds", 300), default=300, min_value=0),
+                    "attention_ack_nudge_after_seconds": _safe_int(automation.get("attention_ack_nudge_after_seconds", 600), default=600, min_value=0),
+                    "unread_nudge_after_seconds": _safe_int(automation.get("unread_nudge_after_seconds", 900), default=900, min_value=0),
+                    "nudge_digest_min_interval_seconds": _safe_int(automation.get("nudge_digest_min_interval_seconds", 120), default=120, min_value=0),
+                    "nudge_max_repeats_per_obligation": _safe_int(automation.get("nudge_max_repeats_per_obligation", 3), default=3, min_value=0),
+                    "nudge_escalate_after_repeats": _safe_int(automation.get("nudge_escalate_after_repeats", 2), default=2, min_value=0),
+                    "actor_idle_timeout_seconds": _safe_int(automation.get("actor_idle_timeout_seconds", 0), default=0, min_value=0),
+                    "keepalive_delay_seconds": _safe_int(automation.get("keepalive_delay_seconds", 120), default=120, min_value=0),
+                    "keepalive_max_per_actor": _safe_int(automation.get("keepalive_max_per_actor", 3), default=3, min_value=0),
+                    "silence_timeout_seconds": _safe_int(automation.get("silence_timeout_seconds", 0), default=0, min_value=0),
+                    "help_nudge_interval_seconds": _safe_int(automation.get("help_nudge_interval_seconds", 600), default=600, min_value=0),
+                    "help_nudge_min_messages": _safe_int(automation.get("help_nudge_min_messages", 10), default=10, min_value=0),
+                    "min_interval_seconds": _safe_int(delivery.get("min_interval_seconds", 0), default=0, min_value=0),
+                    "auto_mark_on_delivery": coerce_bool(delivery.get("auto_mark_on_delivery"), default=False),
+                    "terminal_transcript_visibility": str(tt.get("visibility") or "foreman"),
+                    "terminal_transcript_notify_tail": coerce_bool(tt.get("notify_tail"), default=False),
+                    "terminal_transcript_notify_lines": _safe_int(tt.get("notify_lines", 20), default=20, min_value=1, max_value=80),
+                    "panorama_enabled": coerce_bool(features.get("panorama_enabled"), default=False),
+                    "desktop_pet_enabled": coerce_bool(features.get("desktop_pet_enabled"), default=False),
+                }
+            }
+        }
+
+    @group_router.get("/desktop_pet/launch_token")
+    async def group_desktop_pet_launch_token(request: Request, group_id: str) -> Dict[str, Any]:
+        token = _request_access_token(request)
+        if not token:
+            # Empty password mode: no tokens configured → allow with empty token
+            if not list_access_tokens():
+                return {"ok": True, "result": {"token": ""}}
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "permission_denied", "message": "authentication required", "details": {}},
+            )
+        return {"ok": True, "result": {"token": token}}
+
+    @group_router.put("/settings")
+    async def group_settings_update(group_id: str, req: GroupSettingsRequest) -> Dict[str, Any]:
+        """Update group-scoped automation + delivery settings."""
+        patch: Dict[str, Any] = {}
+        if req.default_send_to is not None:
+            patch["default_send_to"] = str(req.default_send_to)
+        if req.nudge_after_seconds is not None:
+            patch["nudge_after_seconds"] = max(0, req.nudge_after_seconds)
+        if req.reply_required_nudge_after_seconds is not None:
+            patch["reply_required_nudge_after_seconds"] = max(0, req.reply_required_nudge_after_seconds)
+        if req.attention_ack_nudge_after_seconds is not None:
+            patch["attention_ack_nudge_after_seconds"] = max(0, req.attention_ack_nudge_after_seconds)
+        if req.unread_nudge_after_seconds is not None:
+            patch["unread_nudge_after_seconds"] = max(0, req.unread_nudge_after_seconds)
+        if req.nudge_digest_min_interval_seconds is not None:
+            patch["nudge_digest_min_interval_seconds"] = max(0, req.nudge_digest_min_interval_seconds)
+        if req.nudge_max_repeats_per_obligation is not None:
+            patch["nudge_max_repeats_per_obligation"] = max(0, req.nudge_max_repeats_per_obligation)
+        if req.nudge_escalate_after_repeats is not None:
+            patch["nudge_escalate_after_repeats"] = max(0, req.nudge_escalate_after_repeats)
+        if req.actor_idle_timeout_seconds is not None:
+            patch["actor_idle_timeout_seconds"] = max(0, req.actor_idle_timeout_seconds)
+        if req.keepalive_delay_seconds is not None:
+            patch["keepalive_delay_seconds"] = max(0, req.keepalive_delay_seconds)
+        if req.keepalive_max_per_actor is not None:
+            patch["keepalive_max_per_actor"] = max(0, req.keepalive_max_per_actor)
+        if req.silence_timeout_seconds is not None:
+            patch["silence_timeout_seconds"] = max(0, req.silence_timeout_seconds)
+        if req.help_nudge_interval_seconds is not None:
+            patch["help_nudge_interval_seconds"] = max(0, req.help_nudge_interval_seconds)
+        if req.help_nudge_min_messages is not None:
+            patch["help_nudge_min_messages"] = max(0, req.help_nudge_min_messages)
+        if req.min_interval_seconds is not None:
+            patch["min_interval_seconds"] = max(0, req.min_interval_seconds)
+        if req.auto_mark_on_delivery is not None:
+            patch["auto_mark_on_delivery"] = bool(req.auto_mark_on_delivery)
+
+        # Terminal transcript policy (group-scoped)
+        if req.terminal_transcript_visibility is not None:
+            patch["terminal_transcript_visibility"] = str(req.terminal_transcript_visibility)
+        if req.terminal_transcript_notify_tail is not None:
+            patch["terminal_transcript_notify_tail"] = bool(req.terminal_transcript_notify_tail)
+        if req.terminal_transcript_notify_lines is not None:
+            patch["terminal_transcript_notify_lines"] = max(1, min(80, int(req.terminal_transcript_notify_lines)))
+
+        if req.panorama_enabled is not None:
+            patch["panorama_enabled"] = bool(req.panorama_enabled)
+        if req.desktop_pet_enabled is not None:
+            patch["desktop_pet_enabled"] = bool(req.desktop_pet_enabled)
+
+        if not patch:
+            return {"ok": True, "result": {"message": "no changes"}}
+
+        return await ctx.daemon({
+            "op": "group_settings_update",
+            "args": {"group_id": group_id, "patch": patch, "by": req.by}
+        })
+
+    @group_router.get("/automation")
+    async def group_automation_get(group_id: str) -> Dict[str, Any]:
+        """Get group automation rules + snippets + runtime status."""
+        return await ctx.daemon({"op": "group_automation_state", "args": {"group_id": group_id, "by": "user"}})
+
+    @group_router.put("/automation")
+    async def group_automation_update(group_id: str, req: GroupAutomationRequest) -> Dict[str, Any]:
+        """Update group automation rules + snippets."""
+        ruleset = AutomationRuleSet(rules=req.rules, snippets=req.snippets).model_dump()
+        return await ctx.daemon(
+            {
+                "op": "group_automation_update",
+                "args": {"group_id": group_id, "ruleset": ruleset, "expected_version": req.expected_version, "by": req.by},
+            }
+        )
+
+    @group_router.post("/automation/manage")
+    async def group_automation_manage(group_id: str, req: GroupAutomationManageRequest) -> Dict[str, Any]:
+        """Manage group automation incrementally via actions."""
+        return await ctx.daemon(
+            {
+                "op": "group_automation_manage",
+                "args": {
+                    "group_id": group_id,
+                    "actions": [a for a in req.actions if isinstance(a, dict)],
+                    "expected_version": req.expected_version,
+                    "by": req.by,
+                },
+            }
+        )
+
+    @group_router.post("/automation/reset_baseline")
+    async def group_automation_reset_baseline(group_id: str, req: GroupAutomationResetBaselineRequest) -> Dict[str, Any]:
+        """Reset group automation rules/snippets to baseline defaults."""
+        return await ctx.daemon(
+            {
+                "op": "group_automation_reset_baseline",
+                "args": {
+                    "group_id": group_id,
+                    "expected_version": req.expected_version,
+                    "by": req.by,
+                },
+            }
+        )
+
+    @group_router.post("/attach")
+    async def group_attach(group_id: str, req: AttachRequest) -> Dict[str, Any]:
+        return await ctx.daemon({"op": "attach", "args": {"path": req.path, "by": req.by, "group_id": group_id}})
+
+    @group_router.delete("/scopes/{scope_key}")
+    async def group_detach_scope(group_id: str, scope_key: str, by: str = "user") -> Dict[str, Any]:
+        """Detach a scope from a group."""
+        return await ctx.daemon({"op": "group_detach_scope", "args": {"group_id": group_id, "scope_key": scope_key, "by": by}})
+
+    @group_router.get("/ledger/tail")
+    async def ledger_tail(
+        group_id: str,
+        lines: int = 50,
+        with_read_status: bool = False,
+        with_ack_status: bool = False,
+        with_obligation_status: bool = False,
+    ) -> Dict[str, Any]:
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+        raw_lines = read_last_lines(group.ledger_path, int(lines))
+        events = []
+        for ln in raw_lines:
+            try:
+                events.append(json.loads(ln))
+            except Exception:
+                continue
+
+        # Optionally include read status for chat.message events (batch optimized)
+        if with_read_status:
+            from ....kernel.inbox import get_read_status_batch
+            status_map = get_read_status_batch(group, events)
+            for ev in events:
+                event_id = str(ev.get("id") or "")
+                if event_id in status_map:
+                    ev["_read_status"] = status_map[event_id]
+
+        # Optionally include ack status for attention chat.message events (batch optimized)
+        if with_ack_status:
+            from ....kernel.inbox import get_ack_status_batch
+            ack_map = get_ack_status_batch(group, events)
+            for ev in events:
+                event_id = str(ev.get("id") or "")
+                if event_id in ack_map:
+                    ev["_ack_status"] = ack_map[event_id]
+
+        if with_obligation_status:
+            from ....kernel.inbox import get_obligation_status_batch
+            obligation_map = get_obligation_status_batch(group, events)
+            for ev in events:
+                event_id = str(ev.get("id") or "")
+                if event_id in obligation_map:
+                    ev["_obligation_status"] = obligation_map[event_id]
+
+        return {"ok": True, "result": {"events": events}}
+
+    @group_router.get("/ledger/search")
+    async def ledger_search(
+        group_id: str,
+        q: str = "",
+        kind: str = "all",
+        by: str = "",
+        before: str = "",
+        after: str = "",
+        limit: int = 50,
+        with_read_status: bool = False,
+        with_ack_status: bool = False,
+        with_obligation_status: bool = False,
+    ) -> Dict[str, Any]:
+        """Search and paginate messages in the ledger."""
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        from ....kernel.inbox import search_messages, get_read_status_batch
+
+        # Validate and clamp limit
+        limit = max(1, min(200, limit))
+
+        # Validate kind filter
+        kind_filter = kind if kind in ("all", "chat", "notify") else "all"
+
+        events, has_more = search_messages(
+            group,
+            query=q,
+            kind_filter=kind_filter,  # type: ignore
+            by_filter=by,
+            before_id=before,
+            after_id=after,
+            limit=limit,
+        )
+
+        # Optionally include read status (batch optimized)
+        if with_read_status:
+            status_map = get_read_status_batch(group, events)
+            for ev in events:
+                event_id = str(ev.get("id") or "")
+                if event_id in status_map:
+                    ev["_read_status"] = status_map[event_id]
+
+        # Optionally include ack status (batch optimized)
+        if with_ack_status:
+            from ....kernel.inbox import get_ack_status_batch
+            ack_map = get_ack_status_batch(group, events)
+            for ev in events:
+                event_id = str(ev.get("id") or "")
+                if event_id in ack_map:
+                    ev["_ack_status"] = ack_map[event_id]
+
+        if with_obligation_status:
+            from ....kernel.inbox import get_obligation_status_batch
+            obligation_map = get_obligation_status_batch(group, events)
+            for ev in events:
+                event_id = str(ev.get("id") or "")
+                if event_id in obligation_map:
+                    ev["_obligation_status"] = obligation_map[event_id]
+
+        return {
+            "ok": True,
+            "result": {
+                "events": events,
+                "has_more": has_more,
+                "count": len(events),
+            }
+        }
+
+    @group_router.get("/ledger/window")
+    async def ledger_window(
+        group_id: str,
+        center: str,
+        kind: str = "chat",
+        before: int = 30,
+        after: int = 30,
+        with_read_status: bool = False,
+        with_ack_status: bool = False,
+        with_obligation_status: bool = False,
+    ) -> Dict[str, Any]:
+        """Return a bounded window of events around a center event_id."""
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        from ....kernel.inbox import find_event, search_messages, get_read_status_batch
+
+        center_id = str(center or "").strip()
+        if not center_id:
+            raise HTTPException(status_code=400, detail={"code": "missing_center", "message": "missing center event_id"})
+
+        center_event = find_event(group, center_id)
+        if center_event is None:
+            raise HTTPException(status_code=404, detail={"code": "event_not_found", "message": f"event not found: {center_id}"})
+
+        # Validate and clamp window sizes
+        before = max(0, min(200, int(before)))
+        after = max(0, min(200, int(after)))
+
+        kind_filter = kind if kind in ("all", "chat", "notify") else "chat"
+
+        if kind_filter == "chat" and str(center_event.get("kind") or "") != "chat.message":
+            raise HTTPException(status_code=400, detail={"code": "invalid_center_kind", "message": "center event kind must be chat.message for kind=chat"})
+
+        before_events, has_more_before = search_messages(
+            group,
+            query="",
+            kind_filter=kind_filter,  # type: ignore
+            before_id=center_id,
+            limit=before,
+        )
+        after_events, has_more_after = search_messages(
+            group,
+            query="",
+            kind_filter=kind_filter,  # type: ignore
+            after_id=center_id,
+            limit=after,
+        )
+
+        events = [*before_events, center_event, *after_events]
+
+        if with_read_status:
+            status_map = get_read_status_batch(group, events)
+            for ev in events:
+                event_id = str(ev.get("id") or "")
+                if event_id in status_map:
+                    ev["_read_status"] = status_map[event_id]
+
+        if with_ack_status:
+            from ....kernel.inbox import get_ack_status_batch
+            ack_map = get_ack_status_batch(group, events)
+            for ev in events:
+                event_id = str(ev.get("id") or "")
+                if event_id in ack_map:
+                    ev["_ack_status"] = ack_map[event_id]
+
+        if with_obligation_status:
+            from ....kernel.inbox import get_obligation_status_batch
+            obligation_map = get_obligation_status_batch(group, events)
+            for ev in events:
+                event_id = str(ev.get("id") or "")
+                if event_id in obligation_map:
+                    ev["_obligation_status"] = obligation_map[event_id]
+
+        return {
+            "ok": True,
+            "result": {
+                "center_id": center_id,
+                "center_index": len(before_events),
+                "events": events,
+                "has_more_before": has_more_before,
+                "has_more_after": has_more_after,
+                "count": len(events),
+            },
+        }
+
+    @group_router.get("/events/{event_id}/read_status")
+    async def event_read_status(group_id: str, event_id: str) -> Dict[str, Any]:
+        """Get read status for a specific event (which actors have read it)."""
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+
+        from ....kernel.inbox import get_read_status
+        status = get_read_status(group, event_id)
+        return {"ok": True, "result": {"event_id": event_id, "read_status": status}}
+
+    @global_router.websocket("/groups/{group_id}/presentation/browser_surface/ws")
+    async def group_presentation_browser_surface_ws(websocket: WebSocket, group_id: str) -> None:
+        await websocket.accept()
+        slot_id = str(websocket.query_params.get("slot") or "").strip()
+
+        principal = resolve_websocket_principal(websocket)
+        websocket.state.principal = principal
+
+        auth_header = str((getattr(websocket, "headers", {}) or {}).get("authorization") or "").strip()
+        has_header_token = auth_header.lower().startswith("bearer ") and bool(str(auth_header[7:] or "").strip())
+        has_cookie_token = False
+        try:
+            cookies = getattr(websocket, "cookies", None) or {}
+            has_cookie_token = bool(str(cookies.get("cccc_access_token") or "").strip())
+        except Exception:
+            has_cookie_token = False
+        has_query_token = bool(str(websocket.query_params.get("token") or "").strip())
+        if (has_header_token or has_cookie_token or has_query_token) and str(getattr(principal, "kind", "anonymous") or "anonymous") != "user" and websocket_tokens_active():
+            try:
+                await websocket.send_json({"ok": False, "error": {"code": "auth_required", "message": "Invalid or missing authentication token"}})
+            except Exception:
+                pass
+            await websocket.close(code=4401)
+            return
+
+        try:
+            check_group(websocket, group_id)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"code": "permission_denied", "message": str(exc.detail or "permission denied")}
+            try:
+                await websocket.send_json({"ok": False, "error": detail})
+            except Exception:
+                pass
+            await websocket.close(code=1008)
+            return
+
+        if ctx.read_only:
+            try:
+                await websocket.send_json(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "read_only_browser_surface",
+                            "message": "Browser surface control is disabled in read-only mode.",
+                            "details": {},
+                        },
+                    }
+                )
+            except Exception:
+                pass
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                pass
+            return
+
+        group = load_group(group_id)
+        if group is None:
+            await websocket.send_json({"ok": False, "error": {"code": "group_not_found", "message": f"group not found: {group_id}"}})
+            await websocket.close(code=1008)
+            return
+
+        try:
+            ep = get_daemon_endpoint()
+            transport = str(ep.get("transport") or "").strip().lower()
+            if transport == "tcp":
+                host = str(ep.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+                port = int(ep.get("port") or 0)
+                reader, writer = await asyncio.open_connection(host, port, limit=_PRESENTATION_BROWSER_STREAM_LIMIT_BYTES)
+            else:
+                sock_path = ctx.home / "daemon" / "ccccd.sock"
+                path = str(ep.get("path") or sock_path)
+                reader, writer = await asyncio.open_unix_connection(path, limit=_PRESENTATION_BROWSER_STREAM_LIMIT_BYTES)
+        except Exception:
+            await websocket.send_json({"ok": False, "error": {"code": "daemon_unavailable", "message": "ccccd unavailable"}})
+            await websocket.close(code=1011)
+            return
+
+        try:
+            req = {"op": "presentation_browser_attach", "args": {"group_id": group_id, "slot": slot_id, "by": "user"}}
+            writer.write((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+            await writer.drain()
+            line = await reader.readline()
+            try:
+                resp = json.loads(line.decode("utf-8", errors="replace"))
+            except Exception:
+                resp = {}
+            if not isinstance(resp, dict) or not resp.get("ok"):
+                err = resp.get("error") if isinstance(resp.get("error"), dict) else {"code": "browser_surface_attach_failed", "message": "browser surface attach failed"}
+                await websocket.send_json({"ok": False, "error": err})
+                await websocket.close(code=1008)
+                return
+
+            async def _pump_out() -> None:
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    await websocket.send_text(line.decode("utf-8", errors="replace").rstrip("\n"))
+
+            async def _pump_in() -> None:
+                while True:
+                    raw = await websocket.receive_text()
+                    if not raw:
+                        continue
+                    writer.write((raw + "\n").encode("utf-8", errors="replace"))
+                    await writer.drain()
+
+            out_task = asyncio.create_task(_pump_out())
+            in_task = asyncio.create_task(_pump_in())
+            try:
+                done, pending = await asyncio.wait({out_task, in_task}, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        _ = task.result()
+                    except Exception:
+                        pass
+                for task in pending:
+                    task.cancel()
+                try:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                except Exception:
+                    pass
+            except WebSocketDisconnect:
+                pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    @group_router.get("/ledger/stream")
+    async def ledger_stream(group_id: str) -> StreamingResponse:
+        from ..streams import sse_ledger_tail, create_sse_response
+        group = load_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
+        return create_sse_response(sse_ledger_tail(group.ledger_path))
+
+    return [global_router, group_router]
+
+
+def register_group_routes(app: FastAPI, *, ctx: RouteContext) -> None:
+    """Backward-compatible wrapper for app.py registration."""
+    for router in create_routers(ctx):
+        app.include_router(router)

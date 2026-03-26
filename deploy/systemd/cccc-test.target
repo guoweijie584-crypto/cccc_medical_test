@@ -1,0 +1,4 @@
+[Unit]
+Description=CCCC Test Full Stack
+Wants=cccc-test-daemon.service cccc-test-memory-palace.service cccc-test-bootstrap.service cccc-test-web.service cccc-test-api.service
+

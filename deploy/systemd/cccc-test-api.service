@@ -1,0 +1,13 @@
+[Unit]
+Description=CCCC Test Medical API
+After=cccc-test-daemon.service cccc-test-bootstrap.service cccc-test-memory-palace.service
+Requires=cccc-test-daemon.service cccc-test-memory-palace.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -lc 'set -a; source /etc/cccc-test.env; cd "$PROJECT_ROOT"; exec "$VENV_DIR/bin/python" api_server.py'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
