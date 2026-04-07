@@ -127,12 +127,12 @@ class MemoryAgent:
             profile_record.get("content") if profile_record else None
         )
 
-        # 2. Search relevant memories for this patient
+        # 2. Search relevant memories for this patient (hybrid = keyword + semantic)
         search_query = query or "血糖 用药 饮食 运动 并发症"
         relevant_memories = self.client.search(
             query=search_query,
             max_results=10,
-            mode="keyword",
+            mode="hybrid",
             path_prefix=f"patients/{patient_id}",
         )
 
@@ -325,7 +325,7 @@ class MemoryAgent:
         return self.client.search(
             query=query,
             max_results=max_results,
-            mode="keyword",
+            mode="hybrid",
             path_prefix=path_prefix,
         )
 

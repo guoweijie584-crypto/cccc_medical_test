@@ -22,6 +22,7 @@ from config.settings import mask_api_key, read_runtime_llm_settings, write_runti
 from src.agents import GlucoseManagementWorkflow
 from src.evolution import EvaluatorAgent, build_ui_report, run_demo_evaluation
 from src.evolution import get_evaluation_service, VALID_LABELS
+from src.evolution import HumanEvalEvolutionLoop
 from src.llm_client import get_llm_client
 from src.memory import get_memory_agent
 from src.cccc_native.runtime_manager import (
@@ -766,6 +767,29 @@ async def api_get_evolution_timeline(refresh: bool = Query(default=False)) -> Di
         for item in report.get("iterations", [])
     ]
     return {"iterations": timeline}
+
+
+@app.post("/api/evolution/human-driven")
+async def api_run_human_eval_evolution(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> Dict[str, Any]:
+    """Run one cycle of human-evaluation-driven optimization.
+
+    Reads recent BAD/ERROR evaluations, analyzes root causes,
+    and outputs prompt optimizations + memory reinforcements.
+    """
+    memory_agent = get_memory_agent()
+    llm_client = get_llm_client()
+    loop = HumanEvalEvolutionLoop(
+        memory_agent=memory_agent,
+        llm_client=llm_client if llm_client.available else None,
+    )
+    summary = loop.run(limit=limit)
+    try:
+        loop.export_results()
+    except Exception:
+        pass  # non-critical
+    return summary.to_dict()
 
 
 @app.get("/api/config/llm")

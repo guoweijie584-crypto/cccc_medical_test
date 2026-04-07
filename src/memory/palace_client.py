@@ -226,13 +226,28 @@ class MemoryPalaceClient:
         self,
         path: str,
         content: str,
+        *,
+        priority: Optional[int] = None,
+        disclosure: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Update an existing memory node's content (full replace)."""
+        """Update an existing memory node's content and/or metadata.
+
+        Supports partial metadata updates: if priority or disclosure are
+        provided they are sent to Memory Palace for update; otherwise only
+        content is replaced.  The Write Guard on the server side will
+        validate the write before committing.
+        """
+        json_data: Dict[str, Any] = {"content": content}
+        if priority is not None:
+            json_data["priority"] = priority
+        if disclosure is not None:
+            json_data["disclosure"] = disclosure
+
         result = self._run_sync(
             self._request(
                 "PUT", "/browse/node",
                 params={"path": path, "domain": self.domain},
-                json_data={"content": content},
+                json_data=json_data,
             )
         )
         if "error" in result:
@@ -256,10 +271,14 @@ class MemoryPalaceClient:
         query: str,
         *,
         max_results: int = 10,
-        mode: str = "keyword",
+        mode: str = "hybrid",
         path_prefix: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Search memories using keyword/semantic/hybrid retrieval."""
+        """Search memories using keyword/semantic/hybrid retrieval.
+
+        Default mode is 'hybrid' to leverage Memory Palace's full
+        retrieval capability (keyword + semantic matching).
+        """
         filters: Dict[str, Any] = {"domain": self.domain}
         if path_prefix:
             filters["path_prefix"] = path_prefix

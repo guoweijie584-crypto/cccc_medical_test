@@ -1,11 +1,22 @@
-"""Root-cause analysis for prompt and memory issues."""
+"""Root-cause analysis for prompt and memory issues.
+
+Supports two input modes:
+1. Legacy: numeric-score evaluation reports (EvaluatorAgent)
+2. Human-driven: discrete-label human evaluations (EvaluationService)
+"""
 
 from __future__ import annotations
 
 import json
+import re
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .evaluation_service import HumanEvaluation
 
 
 class ProblemType(Enum):
@@ -247,3 +258,177 @@ class AnalyzerAgent:
             f"memory={float(memory_score.get('overall', 0) or 0):.2f}; "
             f"prompt_issues={prompt_count}, memory_issues={memory_count}, workflow_issues={workflow_count}"
         )
+
+    # ── Human evaluation analysis (Line 3) ─────────────────────────
+
+    def analyze_human_evaluation(
+        self,
+        evaluation: "HumanEvaluation",
+        agent_outputs: Optional[Dict[str, str]] = None,
+        memories: Optional[List[Dict[str, Any]]] = None,
+    ) -> AnalysisReport:
+        """Analyze a single BAD/ERROR human evaluation and produce an AnalysisReport.
+
+        Maps discrete labels (safety, advice_direction, reviewer_notes) to
+        concrete ProblemAnalysis items that PromptOptimizer and MemoryOptimizer
+        can act on.
+        """
+        problems: List[ProblemAnalysis] = []
+
+        label = str(evaluation.label or "").upper()
+
+        # ── Safety dimension ───────────────────────────────────────
+        if evaluation.safety in ("risky", "dangerous"):
+            severity = 9.5 if evaluation.safety == "dangerous" else 8.0
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.PROMPT,
+                severity=severity,
+                agent_id="primary",
+                description=f"Human reviewer flagged safety as '{evaluation.safety}'.",
+                suggestion=(
+                    "Add stricter safety guardrails: explicit escalation thresholds, "
+                    "contraindication checks, and emergency-referral triggers."
+                ),
+            ))
+
+        # ── Advice direction dimension ─────────────────────────────
+        if evaluation.advice_direction == "wrong":
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.PROMPT,
+                severity=8.5,
+                agent_id="primary",
+                description="Human reviewer judged advice direction as 'wrong'.",
+                suggestion=(
+                    "Strengthen clinical grounding and evidence-based instruction "
+                    "to prevent incorrect recommendations."
+                ),
+            ))
+        elif evaluation.advice_direction == "partial":
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.PROMPT,
+                severity=6.5,
+                agent_id="primary",
+                description="Human reviewer judged advice direction as 'partial'.",
+                suggestion=(
+                    "Improve completeness: ensure all relevant aspects (medication, "
+                    "diet, exercise, monitoring) are addressed."
+                ),
+            ))
+
+        # ── Personalization dimension ──────────────────────────────
+        if evaluation.personalized is False:
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.PROMPT,
+                severity=6.5,
+                agent_id="primary",
+                description="Response was not personalized to the patient.",
+                suggestion=(
+                    "Force explicit reference to patient profile (age, type, "
+                    "complications, current therapy, recent glucose trend) before giving advice."
+                ),
+            ))
+            # Memory issue: maybe the patient context was not recalled
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.MEMORY,
+                severity=6.0,
+                description="Personalization failure may indicate missing patient memory retrieval.",
+                suggestion=(
+                    "Verify that the patient profile and recent interaction memories "
+                    "are being retrieved and injected into the agent context."
+                ),
+            ))
+
+        # ── Reviewer notes mining ──────────────────────────────────
+        notes = str(evaluation.reviewer_notes or "").strip()
+        if notes:
+            problems.extend(self._mine_reviewer_notes(notes))
+
+        # ── ERROR label: high severity general problem ─────────────
+        if label == "ERROR" and not problems:
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.WORKFLOW,
+                severity=9.0,
+                description="Human reviewer flagged as ERROR — requires detailed review.",
+                suggestion="Inspect the full consultation log and memory state for this case.",
+            ))
+
+        # ── BAD label with no specific dimension flagged ───────────
+        if label == "BAD" and not problems:
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.PROMPT,
+                severity=7.0,
+                agent_id="primary",
+                description="Human reviewer rated response as BAD without specific dimensions flagged.",
+                suggestion=(
+                    "Review primary agent prompt for general quality issues: "
+                    "accuracy, completeness, safety language."
+                ),
+            ))
+
+        # Ensure at least one problem
+        if not problems:
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.UNKNOWN,
+                severity=0.0,
+                description="No actionable issue extracted from this evaluation.",
+                suggestion="Monitor for recurring patterns.",
+            ))
+
+        primary_problem = max(problems, key=lambda p: p.severity)
+        prompt_count = sum(1 for p in problems if p.problem_type == ProblemType.PROMPT)
+        memory_count = sum(1 for p in problems if p.problem_type == ProblemType.MEMORY)
+        summary = (
+            f"human_eval={label}; "
+            f"prompt_issues={prompt_count}, memory_issues={memory_count}, "
+            f"total_problems={len(problems)}"
+        )
+
+        report = AnalysisReport(
+            analysis_id=f"hanal_{uuid.uuid4().hex[:8]}",
+            evaluation_id=str(evaluation.evaluation_id or ""),
+            problems=problems,
+            primary_problem=primary_problem,
+            summary=summary,
+            timestamp=datetime.now().isoformat(),
+        )
+        self.analysis_history.append(report)
+        return report
+
+    def _mine_reviewer_notes(self, notes: str) -> List[ProblemAnalysis]:
+        """Extract problem signals from free-text reviewer notes."""
+        problems: List[ProblemAnalysis] = []
+        lower = notes.lower()
+
+        # Safety keywords
+        safety_kw = ("危险", "低血糖", "急诊", "过敏", "禁忌", "unsafe", "dangerous", "risk", "hypoglycemia")
+        if any(kw in lower for kw in safety_kw):
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.PROMPT,
+                severity=8.5,
+                agent_id="primary",
+                description=f"Reviewer notes mention safety concern: '{notes[:120]}'",
+                suggestion="Reinforce safety checks and contraindication awareness in prompts.",
+            ))
+
+        # Memory / context keywords
+        memory_kw = ("记忆", "遗忘", "没考虑", "上次", "历史", "memory", "forgot", "context", "history")
+        if any(kw in lower for kw in memory_kw):
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.MEMORY,
+                severity=7.0,
+                description=f"Reviewer notes suggest memory/context gap: '{notes[:120]}'",
+                suggestion="Improve memory retrieval coverage and patient history recall.",
+            ))
+
+        # Accuracy keywords
+        accuracy_kw = ("不准", "错误", "不对", "误导", "inaccurate", "wrong", "incorrect", "misleading")
+        if any(kw in lower for kw in accuracy_kw):
+            problems.append(ProblemAnalysis(
+                problem_type=ProblemType.PROMPT,
+                severity=8.0,
+                agent_id="primary",
+                description=f"Reviewer notes indicate accuracy issue: '{notes[:120]}'",
+                suggestion="Strengthen evidence-based grounding and clinical guideline adherence.",
+            ))
+
+        return problems
