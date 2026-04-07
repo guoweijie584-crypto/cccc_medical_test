@@ -73,6 +73,18 @@ class NativeGroupActionRequest(BaseModel):
     state: str = ""
 
 
+class MemoryCreateRequest(BaseModel):
+    patient_id: str
+    category: str = "general"
+    content: str
+    priority: int = 3
+    disclosure: str = ""
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: str
+
+
 class CreatePendingEvaluationRequest(BaseModel):
     patient_id: str
     query: str
@@ -376,6 +388,194 @@ async def api_get_patient_memories(patient_id: str) -> Dict[str, Any]:
     else:
         response["memoryStatus"] = "ok"
     return response
+
+
+# ── Memory Palace API ───────────────────────────────────────────────
+
+
+def _build_memory_tree_node(client: Any, path: str, depth: int = 0, max_depth: int = 3) -> Dict[str, Any]:
+    """Recursively read a Memory Palace node and its children into a tree."""
+    record = client.read(path)
+    if not record:
+        return {"path": path, "content": None, "children": []}
+
+    content_raw = record.get("content")
+    parsed: Dict[str, Any] = {}
+    if isinstance(content_raw, str):
+        try:
+            parsed = json.loads(content_raw)
+        except (json.JSONDecodeError, TypeError):
+            parsed = {"raw": content_raw}
+    elif isinstance(content_raw, dict):
+        parsed = content_raw
+
+    node: Dict[str, Any] = {
+        "path": path,
+        "uri": record.get("uri", ""),
+        "content": parsed,
+        "category": parsed.get("category", path.rsplit("/", 1)[-1] if "/" in path else path),
+        "priority": (record.get("metadata") or {}).get("priority"),
+        "disclosure": (record.get("metadata") or {}).get("disclosure", ""),
+        "created_at": (record.get("metadata") or {}).get("created_at", ""),
+        "children": [],
+    }
+
+    if depth < max_depth:
+        for child in record.get("children") or []:
+            child_path = child.get("path") if isinstance(child, dict) else str(child)
+            if child_path:
+                child_node = _build_memory_tree_node(client, child_path, depth + 1, max_depth)
+                node["children"].append(child_node)
+
+    return node
+
+
+@app.get("/api/memory/tree/{patient_id}")
+async def api_get_memory_tree(patient_id: str) -> Dict[str, Any]:
+    """Get the full memory tree for a patient."""
+    memory_agent = get_memory_agent()
+    client = memory_agent.client
+    root_path = f"patients/{patient_id}"
+    tree = _build_memory_tree_node(client, root_path, depth=0, max_depth=3)
+    return {"patient_id": patient_id, "tree": tree}
+
+
+@app.get("/api/memory/search")
+async def api_search_memories(
+    q: str = Query(default="", description="Search query"),
+    patient_id: Optional[str] = Query(default=None),
+    max_results: int = Query(default=20, ge=1, le=100),
+    mode: str = Query(default="keyword"),
+) -> Dict[str, Any]:
+    """Search memories, optionally scoped to a patient."""
+    memory_agent = get_memory_agent()
+    if not q.strip():
+        return {"results": [], "query": q, "count": 0}
+    results = memory_agent.search_memories(
+        query=q.strip(),
+        patient_id=patient_id,
+        max_results=max_results,
+    )
+    normalized = []
+    for item in results:
+        content = item.get("content")
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                content = {"raw": content}
+        normalized.append({
+            "uri": item.get("uri", ""),
+            "path": item.get("path", ""),
+            "content": content,
+            "category": content.get("category", "memory") if isinstance(content, dict) else "memory",
+            "score": item.get("score", 0),
+            "snippet": item.get("snippet", ""),
+        })
+    return {"results": normalized, "query": q, "count": len(normalized)}
+
+
+@app.post("/api/memory/create")
+async def api_create_memory(request: MemoryCreateRequest) -> Dict[str, Any]:
+    """Create a new memory node for a patient."""
+    memory_agent = get_memory_agent()
+    client = memory_agent.client
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = f"patients/{request.patient_id}/{request.category}/{ts}"
+    memory_content = {
+        "patient_id": request.patient_id,
+        "category": request.category,
+        "content": request.content,
+        "timestamp": datetime.now().isoformat(),
+    }
+    result = client.create(
+        path=path,
+        content=json.dumps(memory_content, ensure_ascii=False),
+        priority=request.priority,
+        disclosure=request.disclosure,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=str(result["error"]))
+    return {
+        "status": "created",
+        "path": path,
+        "uri": result.get("uri", ""),
+        "node": memory_content,
+    }
+
+
+@app.put("/api/memory/{path:path}")
+async def api_update_memory(path: str, request: MemoryUpdateRequest) -> Dict[str, Any]:
+    """Update an existing memory node's content."""
+    memory_agent = get_memory_agent()
+    client = memory_agent.client
+    result = client.update(path=path, content=request.content)
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=str(result["error"]))
+    return {
+        "status": "updated",
+        "path": path,
+        "uri": result.get("uri", ""),
+    }
+
+
+@app.delete("/api/memory/{path:path}")
+async def api_delete_memory(path: str) -> Dict[str, Any]:
+    """Delete a memory node."""
+    memory_agent = get_memory_agent()
+    client = memory_agent.client
+    ok = client.delete(path=path)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to delete memory node")
+    return {"status": "deleted", "path": path}
+
+
+@app.get("/api/memory/stats")
+async def api_get_memory_stats(
+    patient_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Get memory statistics for a patient or globally."""
+    memory_agent = get_memory_agent()
+    client = memory_agent.client
+
+    categories = ["profile", "consultations", "medications", "glucose", "diet", "alerts"]
+    stats: Dict[str, Any] = {"total": 0, "categories": {}}
+
+    if patient_id:
+        root_path = f"patients/{patient_id}"
+        root = client.read(root_path)
+        if root:
+            children = root.get("children") or []
+            for child in children:
+                child_path = child.get("path") if isinstance(child, dict) else str(child)
+                if not child_path:
+                    continue
+                cat_name = child_path.rsplit("/", 1)[-1] if "/" in child_path else child_path
+                child_record = client.read(child_path)
+                count = len(child_record.get("children") or []) if child_record else 0
+                stats["categories"][cat_name] = count
+                stats["total"] += count
+    else:
+        # Global stats: count all patient roots
+        patients_root = client.read("patients")
+        if patients_root:
+            patient_children = patients_root.get("children") or []
+            stats["patient_count"] = len(patient_children)
+            for pc in patient_children[:50]:
+                pc_path = pc.get("path") if isinstance(pc, dict) else str(pc)
+                if pc_path:
+                    pc_record = client.read(pc_path)
+                    if pc_record:
+                        for cat_child in pc_record.get("children") or []:
+                            cat_path = cat_child.get("path") if isinstance(cat_child, dict) else str(cat_child)
+                            if cat_path:
+                                cat_name = cat_path.rsplit("/", 1)[-1]
+                                cat_record = client.read(cat_path)
+                                count = len(cat_record.get("children") or []) if cat_record else 0
+                                stats["categories"][cat_name] = stats["categories"].get(cat_name, 0) + count
+                                stats["total"] += count
+
+    return stats
 
 
 @app.post("/api/consultation")

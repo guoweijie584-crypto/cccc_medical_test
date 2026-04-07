@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 
 import { EvolutionReport } from "./EvolutionReport";
+import { EvaluationView } from "./EvaluationView";
 import { LlmConfigPanel } from "./LlmConfigPanel";
+import { MemoryPalaceView } from "./MemoryPalaceView";
 import { NativeDashboard } from "./NativeDashboard";
 import { PatientDetail } from "./PatientDetail";
 import { PatientList } from "./PatientList";
@@ -44,7 +46,7 @@ interface MedicalTabProps {
   isVisible: boolean;
 }
 
-type MedicalView = "dashboard" | "list" | "detail" | "evolution" | "config";
+type MedicalView = "dashboard" | "list" | "detail" | "evolution" | "config" | "memory" | "evaluation";
 
 export function MedicalTab({ isDark, isVisible }: MedicalTabProps) {
   const [activeView, setActiveView] = useState<MedicalView>("dashboard");
@@ -89,6 +91,8 @@ export function MedicalTab({ isDark, isVisible }: MedicalTabProps) {
     detail: selectedPatient?.name || "患者详情",
     evolution: "评测/优化看板",
     config: "API / Actor 配置",
+    memory: "记忆宫殿",
+    evaluation: "人工评价",
   };
 
   return (
@@ -111,6 +115,18 @@ export function MedicalTab({ isDark, isVisible }: MedicalTabProps) {
               返回看板
             </button>
           )}
+          <button
+            onClick={() => setActiveView("memory")}
+            className={`glass-btn px-3 py-1.5 text-sm rounded-lg ${activeView === "memory" ? "glass-tab-active" : ""}`}
+          >
+            🏛️ 记忆
+          </button>
+          <button
+            onClick={() => setActiveView("evaluation")}
+            className={`glass-btn px-3 py-1.5 text-sm rounded-lg ${activeView === "evaluation" ? "glass-tab-active" : ""}`}
+          >
+            📋 评价
+          </button>
           <button
             onClick={() => setActiveView("list")}
             className={`glass-btn px-3 py-1.5 text-sm rounded-lg ${activeView === "list" ? "glass-tab-active" : ""}`}
@@ -163,6 +179,10 @@ export function MedicalTab({ isDark, isVisible }: MedicalTabProps) {
           />
         ) : activeView === "detail" && selectedPatient ? (
           <PatientDetail patient={selectedPatient} isDark={isDark} />
+        ) : activeView === "memory" ? (
+          <MemoryPalaceView isDark={isDark} />
+        ) : activeView === "evaluation" ? (
+          <EvaluationView isDark={isDark} />
         ) : activeView === "evolution" ? (
           <EvolutionReport isDark={isDark} />
         ) : (
