@@ -80,10 +80,10 @@ class GlucoseManagementWorkflow:
         primary_response = str(primary_result.get("response") or "").strip()
 
         dialogue = {
-            "turn": len(self.memory_agent.session_memories.get(patient_id, [])) + 1,
             "speaker": "patient",
             "content": query,
             "assistant_response": primary_response,
+            "timestamp": datetime.now().isoformat(),
         }
         extracted_facts = self.memory_agent.extract_facts_from_interaction(
             patient_id=patient_id,
@@ -95,6 +95,14 @@ class GlucoseManagementWorkflow:
             patient_id=patient_id,
             dialogue=dialogue,
             extracted_facts=extracted_facts,
+        )
+
+        # Also store the full consultation record
+        self.memory_agent.store_consultation_record(
+            patient_id=patient_id,
+            query=query,
+            response=primary_response,
+            expert_opinions=expert_opinions,
         )
 
         end_time = datetime.now()

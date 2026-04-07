@@ -1,22 +1,43 @@
 """
-Evolution Module - 自进化闭环系统
+Evolution Module — Self-Evolution System
 
-包含：
-- EvaluatorAgent: 质检员，评估回答和记忆质量
-- AnalyzerAgent: 分析师，问题归因
-- PromptOptimizer: 提示词优化器
-- MemoryOptimizer: 记忆优化器
-- SelfEvolutionLoop: 双闭环主控制器
+Components:
+- EvaluationService: Human doctor evaluation collection (replaces old EvaluatorAgent)
+- AnalyzerAgent: Root-cause analysis (triggered by BAD/ERROR human evaluations)
+- PromptOptimizer: Prompt optimization
+- MemoryOptimizer: Memory optimization
+- SelfEvolutionLoop: Dual-loop controller
+
+Legacy components (kept for backward compatibility):
+- EvaluatorAgent: Old LLM self-evaluation (deprecated, use EvaluationService)
 """
 
+# New: Human evaluation service
+from .evaluation_service import (
+    EvaluationService,
+    HumanEvaluation,
+    EvaluationStats,
+    get_evaluation_service,
+    VALID_LABELS,
+)
+
+# Legacy (kept for backward compat, but deprecated)
 from .evaluator import EvaluatorAgent, EvaluationReport, ResponseScore, MemoryScore
+
+# Still active
 from .analyzer import AnalyzerAgent, AnalysisReport, ProblemType
 from .optimizers import PromptOptimizer, MemoryOptimizer, PromptOptimization, MemoryOptimization
 from .self_evolution_loop import SelfEvolutionLoop, IterationResult, EvolutionSummary
 from .demo_service import build_ui_report, load_test_cases, run_demo_evaluation
 
 __all__ = [
-    # Evaluator
+    # New evaluation service
+    "EvaluationService",
+    "HumanEvaluation",
+    "EvaluationStats",
+    "get_evaluation_service",
+    "VALID_LABELS",
+    # Legacy evaluator (deprecated)
     "EvaluatorAgent",
     "EvaluationReport",
     "ResponseScore",

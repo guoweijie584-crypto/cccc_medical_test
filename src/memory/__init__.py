@@ -1,13 +1,18 @@
 """
-Memory Module - Memory Palace Integration
+Memory Module — Memory Palace Integration
+
+All memory management is delegated to Memory Palace.
+No internal three-layer memory.
 """
 
-from .palace_client import MemoryPalaceClientSync
-from .memory_agent import MemoryAgent, PatientMemory, get_memory_agent
+from .palace_client import MemoryPalaceClient, MemoryPalaceClientSync
+from .memory_agent import MemoryAgent, PatientMemory, Priority, get_memory_agent
 
 __all__ = [
-    "MemoryPalaceClientSync", 
+    "MemoryPalaceClient",
+    "MemoryPalaceClientSync",
     "MemoryAgent",
     "PatientMemory",
-    "get_memory_agent"
+    "Priority",
+    "get_memory_agent",
 ]

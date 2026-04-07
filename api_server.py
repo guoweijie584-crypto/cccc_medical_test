@@ -21,6 +21,7 @@ from config.settings import PATIENT_DATA_FILE
 from config.settings import mask_api_key, read_runtime_llm_settings, write_runtime_llm_settings
 from src.agents import GlucoseManagementWorkflow
 from src.evolution import EvaluatorAgent, build_ui_report, run_demo_evaluation
+from src.evolution import get_evaluation_service, VALID_LABELS
 from src.llm_client import get_llm_client
 from src.memory import get_memory_agent
 from src.cccc_native.runtime_manager import (
@@ -70,6 +71,22 @@ class NativeActorLlmConfigRequest(BaseModel):
 class NativeGroupActionRequest(BaseModel):
     target: str
     state: str = ""
+
+
+class CreatePendingEvaluationRequest(BaseModel):
+    patient_id: str
+    query: str
+    response: str
+    expert_opinions: Dict[str, str] = {}
+
+
+class SubmitEvaluationRequest(BaseModel):
+    label: str  # GOOD / BAD / NEUTRAL / ERROR
+    safety: Optional[str] = None
+    personalized: Optional[bool] = None
+    advice_direction: Optional[str] = None
+    reviewer_notes: str = ""
+    reviewer_id: str = ""
 
 
 _report_lock = threading.Lock()
@@ -403,6 +420,116 @@ async def api_create_consultation(request: ConsultationRequest) -> Dict[str, Any
     else:
         response["memoryStatus"] = "ok"
     return response
+
+
+# ── Evaluation API (Human Doctor Evaluation) ──────────────────────
+
+
+@app.post("/api/evaluations/pending")
+async def api_create_pending_evaluation(request: CreatePendingEvaluationRequest) -> Dict[str, Any]:
+    """Create a pending evaluation record after a consultation.
+
+    Called by the system after each patient interaction.
+    """
+    service = get_evaluation_service()
+    try:
+        evaluation = service.create_pending_evaluation(
+            patient_id=request.patient_id,
+            query=request.query,
+            response=request.response,
+            expert_opinions=request.expert_opinions or {},
+        )
+        return {
+            "status": "created",
+            "evaluation_id": evaluation.evaluation_id,
+            "evaluation": evaluation.to_dict(),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/evaluations/pending")
+async def api_get_pending_evaluations(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> Dict[str, Any]:
+    """Get pending evaluations for doctors to review."""
+    service = get_evaluation_service()
+    try:
+        evaluations = service.get_pending_evaluations(limit=limit)
+        return {
+            "evaluations": [e.to_dict() for e in evaluations],
+            "count": len(evaluations),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/evaluations/{evaluation_id}/submit")
+async def api_submit_evaluation(
+    evaluation_id: str,
+    request: SubmitEvaluationRequest,
+) -> Dict[str, Any]:
+    """Doctor submits an evaluation for a pending record."""
+    service = get_evaluation_service()
+    try:
+        evaluation = service.submit_evaluation(
+            evaluation_id=evaluation_id,
+            label=request.label,
+            safety=request.safety,
+            personalized=request.personalized,
+            advice_direction=request.advice_direction,
+            reviewer_notes=request.reviewer_notes,
+            reviewer_id=request.reviewer_id,
+        )
+        return {
+            "status": "submitted",
+            "evaluation_id": evaluation.evaluation_id,
+            "label": evaluation.label,
+            "evaluation": evaluation.to_dict(),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/evaluations/stats")
+async def api_get_evaluation_stats(
+    patient_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Get aggregated evaluation statistics."""
+    service = get_evaluation_service()
+    try:
+        stats = service.get_evaluation_stats(patient_id=patient_id)
+        return stats.to_dict()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/evaluations/bad")
+async def api_get_bad_evaluations(
+    limit: int = Query(default=10, ge=1, le=100),
+) -> Dict[str, Any]:
+    """Get recent BAD and ERROR evaluations for self-evolution analysis."""
+    service = get_evaluation_service()
+    try:
+        evaluations = service.get_bad_evaluations(limit=limit)
+        return {
+            "evaluations": [e.to_dict() for e in evaluations],
+            "count": len(evaluations),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/evaluations/{evaluation_id}")
+async def api_get_evaluation(evaluation_id: str) -> Dict[str, Any]:
+    """Get a single evaluation by ID."""
+    service = get_evaluation_service()
+    evaluation = service.get_evaluation(evaluation_id)
+    if evaluation is None:
+        raise HTTPException(status_code=404, detail=f"Evaluation {evaluation_id} not found")
+    return evaluation.to_dict()
 
 
 @app.get("/api/evolution/report")

@@ -1,4 +1,18 @@
-"""Memory agent for layered patient memory management."""
+"""Medical Memory Palace adapter.
+
+All memory storage, retrieval, and governance is delegated to Memory Palace.
+No more three-layer memory (short/mid/long term).
+
+URI scheme:
+    patients/{patient_id}/profile          — patient profile
+    patients/{patient_id}/consultations/*   — consultation records
+    patients/{patient_id}/medications/*     — medication events
+    patients/{patient_id}/glucose/*         — glucose readings
+    patients/{patient_id}/diet/*            — diet records
+    patients/{patient_id}/alerts/*          — safety alerts
+    evaluations/pending/*                   — pending human evaluations
+    evaluations/completed/*                 — completed evaluations
+"""
 
 from __future__ import annotations
 
@@ -10,11 +24,26 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from config.settings import PROJECT_ROOT, prompt_path_for
-from .palace_client import MemoryPalaceClientSync
+from .palace_client import MemoryPalaceClient
 
+
+# ── URI helpers ─────────────────────────────────────────────────────
+
+def _patient_path(patient_id: str, *segments: str) -> str:
+    """Build a patient-scoped path."""
+    parts = ["patients", patient_id] + list(segments)
+    return "/".join(parts)
+
+
+def _timestamp_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+# ── Data classes ────────────────────────────────────────────────────
 
 @dataclass
 class PatientMemory:
+    """A patient memory retrieved from Memory Palace."""
     patient_id: str
     data: Dict[str, Any]
 
@@ -32,19 +61,34 @@ class PatientMemory:
         return "\n".join(snippets)
 
 
+# ── Priority constants ──────────────────────────────────────────────
+
+class Priority:
+    """Memory retrieval priority (lower = higher priority)."""
+    SAFETY_ALERT = 0
+    CORE_PROFILE = 1
+    RECENT_KEY_EVENT = 2
+    CONSULTATION = 3
+    AUXILIARY = 4
+    LOW_PRIORITY = 5
+
+
+# ── Main Agent ──────────────────────────────────────────────────────
+
 class MemoryAgent:
-    """Maintains short-, mid-, and long-term memory for a patient."""
+    """Medical Memory Palace adapter.
+
+    Delegates ALL memory operations to Memory Palace.
+    No internal memory layers. No session_memories dict.
+    """
 
     def __init__(
         self,
-        palace_client: Optional[MemoryPalaceClientSync] = None,
-        domain: str = "medical",
+        palace_client: Optional[MemoryPalaceClient] = None,
         system_prompt: Optional[str] = None,
     ) -> None:
-        self.client = palace_client or MemoryPalaceClientSync()
-        self.domain = domain
+        self.client = palace_client or MemoryPalaceClient()
         self.system_prompt = system_prompt or self._load_system_prompt()
-        self.session_memories: Dict[str, List[Dict[str, Any]]] = {}
 
     def _load_system_prompt(self) -> str:
         path = prompt_path_for("memory")
@@ -52,8 +96,9 @@ class MemoryAgent:
             return path.read_text(encoding="utf-8").strip()
         return (
             "You are the Memory Agent for a diabetes-management multi-agent system. "
-            "Capture clinically relevant facts, separate short/mid/long-term memory, "
-            "and avoid storing noisy or speculative content."
+            "You manage patient memories through Memory Palace — storing consultation "
+            "records, medication changes, glucose readings, and safety alerts. "
+            "Use appropriate priority levels and disclosure conditions."
         )
 
     def get_prompt(self) -> str:
@@ -62,53 +107,98 @@ class MemoryAgent:
     def set_prompt(self, prompt: str) -> None:
         self.system_prompt = str(prompt or "").strip()
 
+    # ── Context retrieval ───────────────────────────────────────────
+
     def retrieve_patient_context(
         self,
         patient_id: str,
         query: str = "",
-        context_type: str = "full",
     ) -> Dict[str, Any]:
-        profile_uri = f"medical://patient/{patient_id}/profile"
-        profile_record = self.client.read(profile_uri) or {}
-        profile_content = self._parse_content(profile_record.get("content"))
+        """Retrieve patient context from Memory Palace.
 
-        mid_term = self.search_relevant_memories(
-            query=query or "血糖 用药 饮食 运动 并发症",
-            patient_id=patient_id,
-            max_results=8,
+        No more short/mid/long term layers.
+        Uses Memory Palace search with patient path prefix,
+        ordered by priority and relevance.
+        """
+        # 1. Read patient profile
+        profile_path = _patient_path(patient_id, "profile")
+        profile_record = self.client.read(profile_path)
+        profile_content = self._parse_content(
+            profile_record.get("content") if profile_record else None
         )
-        short_term = list(self.session_memories.get(patient_id, []))
+
+        # 2. Search relevant memories for this patient
+        search_query = query or "血糖 用药 饮食 运动 并发症"
+        relevant_memories = self.client.search(
+            query=search_query,
+            max_results=10,
+            mode="keyword",
+            path_prefix=f"patients/{patient_id}",
+        )
 
         return {
             "patient_id": patient_id,
-            "context_type": context_type,
-            "long_term": profile_content,
-            "mid_term": mid_term,
-            "short_term": short_term,
-            "profile": self._profile_to_text(profile_content),
-            "recent_memories": mid_term,
-            "session_history": short_term,
+            "profile": profile_content,
+            "profile_text": self._profile_to_text(profile_content),
+            "relevant_memories": relevant_memories,
+            "memory_count": len(relevant_memories),
         }
 
-    def build_agent_context(self, patient_id: str, agent_type: str, current_query: str) -> str:
-        context = self.retrieve_patient_context(patient_id=patient_id, query=current_query)
-        sections: list[str] = [f"Agent: {agent_type}", f"Current query: {current_query}"]
+    def build_agent_context(
+        self,
+        patient_id: str,
+        agent_type: str,
+        current_query: str,
+    ) -> str:
+        """Build context string for an agent.
 
-        if context["profile"]:
-            sections.append("## Long-term patient profile")
-            sections.append(context["profile"])
+        Unified context — no more three-layer organization.
+        """
+        ctx = self.retrieve_patient_context(patient_id, current_query)
+        sections: list[str] = [
+            f"Agent: {agent_type}",
+            f"Current query: {current_query}",
+        ]
 
-        if context["mid_term"]:
-            sections.append("## Mid-term relevant memory")
-            for item in context["mid_term"][:5]:
-                sections.append(f"- {self._memory_brief(item)}")
+        if ctx["profile_text"]:
+            sections.append("## Patient Profile")
+            sections.append(ctx["profile_text"])
 
-        if context["short_term"]:
-            sections.append("## Short-term session memory")
-            for item in context["short_term"][-5:]:
+        if ctx["relevant_memories"]:
+            sections.append("## Relevant Memories")
+            for item in ctx["relevant_memories"][:8]:
                 sections.append(f"- {self._memory_brief(item)}")
 
         return "\n".join(sections)
+
+    # ── Memory storage ──────────────────────────────────────────────
+
+    def store_consultation_record(
+        self,
+        patient_id: str,
+        query: str,
+        response: str,
+        expert_opinions: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Store a consultation record in Memory Palace."""
+        ts = _timestamp_id()
+        path = _patient_path(patient_id, "consultations", ts)
+        record = {
+            "patient_id": patient_id,
+            "query": query,
+            "response": response,
+            "expert_opinions": expert_opinions or {},
+            "timestamp": datetime.now().isoformat(),
+        }
+        result = self.client.create(
+            path=path,
+            content=json.dumps(record, ensure_ascii=False),
+            priority=Priority.CONSULTATION,
+            disclosure="当回顾患者历史咨询记录时",
+        )
+        if "error" not in result:
+            return result.get("uri") or f"{self.client.domain}://{path}"
+        return None
 
     def extract_facts_from_interaction(
         self,
@@ -118,38 +208,41 @@ class MemoryAgent:
         primary_response: str,
         expert_opinions: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, str]]:
+        """Extract clinically relevant facts from an interaction."""
         text = "\n".join(
             [query, primary_response] + list((expert_opinions or {}).values())
         )
         facts: list[Dict[str, str]] = []
 
-        def add_fact(category: str, content: str, importance: str = "normal") -> None:
+        def _add(category: str, content: str, importance: str = "normal", disclosure: str = "") -> None:
             if not any(f["category"] == category and f["content"] == content for f in facts):
-                facts.append(
-                    {
-                        "category": category,
-                        "content": content,
-                        "importance": importance,
-                    }
-                )
+                facts.append({
+                    "category": category,
+                    "content": content,
+                    "importance": importance,
+                    "disclosure": disclosure,
+                })
 
+        # Glucose reading
         glucose_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:mmol/?L)?", text, flags=re.IGNORECASE)
         if glucose_match and "血糖" in text:
-            add_fact("glucose", f"Patient discussed glucose reading {glucose_match.group(1)} mmol/L")
+            _add("glucose", f"血糖读数 {glucose_match.group(1)} mmol/L",
+                 disclosure="当评估血糖控制情况时")
 
+        # Keyword-based extraction
         keyword_map = {
-            "medication": ("药", "剂量", "胰岛素", "二甲双胍", "格列", "阿卡波糖"),
-            "diet": ("饮食", "水果", "早餐", "晚餐", "碳水", "GI"),
-            "exercise": ("运动", "步行", "跑步", "锻炼"),
-            "complication": ("并发症", "肾", "眼底", "足", "神经"),
-            "safety": ("低血糖", "急诊", "风险", "酮症酸中毒", "DKA"),
+            "medication": (("药", "剂量", "胰岛素", "二甲双胍", "格列", "阿卡波糖"), "当讨论用药方案时"),
+            "diet": (("饮食", "水果", "早餐", "晚餐", "碳水", "GI"), "当给出饮食建议时"),
+            "exercise": (("运动", "步行", "跑步", "锻炼"), "当讨论运动方案时"),
+            "complication": (("并发症", "肾", "眼底", "足", "神经"), "当评估并发症风险时"),
+            "safety": (("低血糖", "急诊", "风险", "酮症酸中毒", "DKA"), "当评估安全风险时"),
         }
-        for category, keywords in keyword_map.items():
-            if any(keyword in text for keyword in keywords):
-                add_fact(category, f"Consultation touched on {category} management")
+        for category, (keywords, disclosure) in keyword_map.items():
+            if any(kw in text for kw in keywords):
+                _add(category, f"咨询涉及{category}管理", disclosure=disclosure)
 
         if not facts:
-            add_fact("consultation", "General diabetes management consultation")
+            _add("consultation", "常规糖尿病管理咨询", disclosure="当回顾患者咨询历史时")
 
         return facts
 
@@ -159,112 +252,84 @@ class MemoryAgent:
         dialogue: Dict[str, Any],
         extracted_facts: List[Dict[str, str]],
     ) -> List[str]:
+        """Store extracted facts as individual memories in Memory Palace."""
         stored_uris: List[str] = []
-        timestamp = datetime.now().isoformat()
-        session_bucket = self.session_memories.setdefault(patient_id, [])
+        ts = _timestamp_id()
 
-        for fact in extracted_facts:
-            category = str(fact.get("category") or "general").strip() or "general"
-            uri = f"medical://patient/{patient_id}/{category}/{timestamp}"
+        for i, fact in enumerate(extracted_facts):
+            category = fact.get("category", "general")
+            path = _patient_path(patient_id, category, f"{ts}_{i}")
+            importance = fact.get("importance", "normal")
+            disclosure = fact.get("disclosure", "")
+
+            # Map importance to priority
+            priority_map = {"high": Priority.RECENT_KEY_EVENT, "normal": Priority.CONSULTATION, "low": Priority.LOW_PRIORITY}
+            priority = priority_map.get(importance, Priority.CONSULTATION)
+
+            # Special: safety facts get highest priority
+            if category == "safety":
+                priority = Priority.SAFETY_ALERT
+
             memory_content = {
                 "patient_id": patient_id,
                 "category": category,
-                "content": str(fact.get("content") or "").strip(),
-                "importance": str(fact.get("importance") or "normal").strip() or "normal",
+                "content": fact.get("content", ""),
+                "importance": importance,
                 "source_dialogue": dialogue,
-                "timestamp": timestamp,
+                "timestamp": datetime.now().isoformat(),
             }
 
             result = self.client.create(
+                path=path,
                 content=json.dumps(memory_content, ensure_ascii=False),
-                uri=uri,
-                metadata={
-                    "category": category,
-                    "importance": memory_content["importance"],
-                    "patient_id": patient_id,
-                },
+                priority=priority,
+                disclosure=disclosure,
             )
             if "error" not in result:
+                uri = result.get("uri") or f"{self.client.domain}://{path}"
                 stored_uris.append(uri)
-
-            session_bucket.append(memory_content)
 
         return stored_uris
 
     def update_patient_profile(self, patient_id: str, updates: Dict[str, Any]) -> bool:
-        uri = f"medical://patient/{patient_id}/profile"
-        existing = self.client.read(uri) or {}
-        current = self._parse_content(existing.get("content"))
-        current.update(dict(updates or {}))
-        current["last_updated"] = datetime.now().isoformat()
+        """Update a patient's profile in Memory Palace."""
+        path = _patient_path(patient_id, "profile")
+        existing = self.client.read(path)
 
-        payload = json.dumps(current, ensure_ascii=False)
-        if existing.get("content") is not None:
-            result = self.client.update(uri=uri, content=payload, reason="profile update")
+        if existing and existing.get("content") is not None:
+            current = self._parse_content(existing["content"])
+            current.update(updates)
+            current["last_updated"] = datetime.now().isoformat()
+            result = self.client.update(
+                path=path,
+                content=json.dumps(current, ensure_ascii=False),
+            )
         else:
+            profile = {**updates, "last_updated": datetime.now().isoformat()}
             result = self.client.create(
-                content=payload,
-                uri=uri,
-                metadata={"type": "patient_profile", "patient_id": patient_id},
+                path=path,
+                content=json.dumps(profile, ensure_ascii=False),
+                priority=Priority.CORE_PROFILE,
+                disclosure="当需要了解患者基本信息时",
             )
         return "error" not in result
 
-    def search_relevant_memories(
+    def search_memories(
         self,
         query: str,
         patient_id: Optional[str] = None,
-        time_range: Optional[str] = None,
         max_results: int = 10,
     ) -> List[Dict[str, Any]]:
-        search_query = str(query or "").strip() or "glucose medication diet exercise"
-        if patient_id:
-            search_query = f"{search_query} patient:{patient_id}"
-
-        results = self.client.search(
-            query=search_query,
-            domain=self.domain,
+        """Search memories, optionally scoped to a patient."""
+        path_prefix = f"patients/{patient_id}" if patient_id else None
+        return self.client.search(
+            query=query,
             max_results=max_results,
             mode="keyword",
+            path_prefix=path_prefix,
         )
-        if patient_id and not results:
-            results = self.client.search(
-                query=patient_id,
-                domain=self.domain,
-                max_results=max_results,
-                mode="keyword",
-            )
-        parsed_results: List[Dict[str, Any]] = []
-        for mem in results:
-            content = self._parse_content(mem.get("content"))
-            if patient_id and content.get("patient_id") not in ("", patient_id):
-                continue
-            parsed_results.append(
-                {
-                    "uri": mem.get("uri", ""),
-                    "content": content,
-                    "metadata": dict(mem.get("metadata") or {}),
-                    "score": float(mem.get("score", 0) or 0),
-                    "timestamp": content.get("timestamp", ""),
-                }
-            )
 
-        if patient_id and not parsed_results:
-            parsed_results.extend(
-                {
-                    "uri": f"session://{patient_id}/{idx}",
-                    "content": item,
-                    "metadata": {"source": "session"},
-                    "score": 0.0,
-                    "timestamp": item.get("timestamp", ""),
-                }
-                for idx, item in enumerate(self.session_memories.get(patient_id, [])[-max_results:])
-            )
-        return parsed_results[:max_results]
-
-    def list_patient_memories(self, patient_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-        combined = self.search_relevant_memories(query=patient_id, patient_id=patient_id, max_results=limit)
-        combined.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
-        return combined[:limit]
+    # ── Helpers ─────────────────────────────────────────────────────
 
     def _profile_to_text(self, profile: Dict[str, Any]) -> str:
         if not profile:
@@ -273,30 +338,28 @@ class MemoryAgent:
         for key, value in profile.items():
             if value in (None, "", [], {}):
                 continue
-            if key == "patient_snapshot" and isinstance(value, dict):
-                lines.append("patient_snapshot:")
+            if isinstance(value, dict):
+                lines.append(f"{key}:")
                 for sub_key, sub_value in value.items():
-                    if sub_value in (None, "", [], {}):
-                        continue
-                    lines.append(f"  {sub_key}: {sub_value}")
+                    if sub_value not in (None, "", [], {}):
+                        lines.append(f"  {sub_key}: {sub_value}")
                 continue
             lines.append(f"{key}: {value}")
         return "\n".join(lines)
 
     def _memory_brief(self, item: Dict[str, Any]) -> str:
         content = item.get("content")
-        if isinstance(item, dict) and not isinstance(content, dict):
-            category = item.get("category", "memory")
-            text = item.get("content", "")
-            ts = item.get("timestamp", "")
-            if text:
-                return f"[{category}] {text} ({ts})"
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                return content[:100] if content else str(item)
         if isinstance(content, dict):
             category = content.get("category", "memory")
             text = content.get("content", "")
             ts = content.get("timestamp", "")
             return f"[{category}] {text} ({ts})"
-        return str(item)
+        return str(item)[:100]
 
     def _parse_content(self, content: Any) -> Dict[str, Any]:
         if isinstance(content, dict):
@@ -308,6 +371,8 @@ class MemoryAgent:
         except Exception:
             return {"raw": str(content)}
 
+
+# ── Module-level singleton ──────────────────────────────────────────
 
 _memory_agent: Optional[MemoryAgent] = None
 
