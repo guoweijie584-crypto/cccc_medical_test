@@ -84,6 +84,8 @@ class MemoryCreateRequest(BaseModel):
 
 class MemoryUpdateRequest(BaseModel):
     content: str
+    priority: Optional[int] = None
+    disclosure: Optional[str] = None
 
 
 class CreatePendingEvaluationRequest(BaseModel):
@@ -446,7 +448,7 @@ async def api_search_memories(
     q: str = Query(default="", description="Search query"),
     patient_id: Optional[str] = Query(default=None),
     max_results: int = Query(default=20, ge=1, le=100),
-    mode: str = Query(default="keyword"),
+    mode: str = Query(default="hybrid"),
 ) -> Dict[str, Any]:
     """Search memories, optionally scoped to a patient."""
     memory_agent = get_memory_agent()
@@ -507,10 +509,15 @@ async def api_create_memory(request: MemoryCreateRequest) -> Dict[str, Any]:
 
 @app.put("/api/memory/{path:path}")
 async def api_update_memory(path: str, request: MemoryUpdateRequest) -> Dict[str, Any]:
-    """Update an existing memory node's content."""
+    """Update an existing memory node's content and/or metadata."""
     memory_agent = get_memory_agent()
     client = memory_agent.client
-    result = client.update(path=path, content=request.content)
+    result = client.update(
+        path=path,
+        content=request.content,
+        priority=request.priority,
+        disclosure=request.disclosure,
+    )
     if "error" in result:
         raise HTTPException(status_code=500, detail=str(result["error"]))
     return {
@@ -620,6 +627,20 @@ async def api_create_consultation(request: ConsultationRequest) -> Dict[str, Any
         response["memoryError"] = memory_error
     else:
         response["memoryStatus"] = "ok"
+
+    # Automatically create pending evaluation record (line1 → line3)
+    try:
+        eval_service = get_evaluation_service()
+        pending_eval = eval_service.create_pending_evaluation(
+            patient_id=request.patient_id,
+            query=request.query,
+            response=str(result.get("primary_response") or ""),
+            expert_opinions=dict(result.get("expert_opinions") or {}),
+        )
+        response["pendingEvaluationId"] = pending_eval.evaluation_id
+    except Exception:
+        pass  # Non-critical: don't fail consultation if evaluation creation fails
+
     return response
 
 

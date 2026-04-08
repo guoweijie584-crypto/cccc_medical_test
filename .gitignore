@@ -36,6 +36,9 @@ nul
 cccc_medical-main/web/node_modules/
 cccc_medical-main/web/dist/
 cccc_medical-main/web/.vite/
+medical-ui/node_modules/
+medical-ui/dist/
+medical-ui/.vite/
 
 # Generated test/evaluation output
 tests/output/
