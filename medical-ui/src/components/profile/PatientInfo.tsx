@@ -36,7 +36,7 @@ export function PatientInfo() {
       <div className="grid grid-cols-2 gap-3">
         <InfoItem label="患者ID" value={patient.id} />
         <InfoItem label="确诊时间" value={patient.diagnosis_date || '—'} />
-        <InfoItem label="糖尿病类型" value={patient.diabetes_type} />
+        <InfoItem label="糖尿病类型" value={patient.diabetes_type || patient.diabetesType || '2型'} />
         <InfoItem label="并发症" value={
           patient.complications?.length ? patient.complications.join('、') : '无'
         } />

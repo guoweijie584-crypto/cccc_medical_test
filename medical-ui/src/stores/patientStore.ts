@@ -6,10 +6,19 @@ export interface Patient {
   name: string;
   age: number;
   gender: string;
-  diabetes_type: string;
+  diabetesType?: string;
+  diabetes_type?: string;
+  diagnosisDate?: string;
   diagnosis_date?: string;
   medications?: string[];
   complications?: string[];
+  glucoseHistory?: Array<{
+    timestamp: string;
+    type: string;
+    value: number;
+    note?: string;
+  }>;
+  // Computed aliases for frontend components
   current_medications?: Array<{
     name: string;
     dosage: string;
@@ -44,7 +53,7 @@ export const usePatientStore = create<PatientStore>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const data = await api.get<{ patients: Patient[] }>('/api/patients');
-      const patients = data.patients || [];
+      const patients = (data.patients || []).map(normalizePatient);
       set({
         patients,
         selectedPatientId: patients.length > 0 ? patients[0].id : null,
@@ -92,3 +101,33 @@ export const usePatientStore = create<PatientStore>((set, get) => ({
     return patients.find((p) => p.id === selectedPatientId) || null;
   },
 }));
+
+/** Normalize backend camelCase fields to frontend-friendly aliases */
+function normalizePatient(p: Patient): Patient {
+  // diabetes_type alias
+  p.diabetes_type = p.diabetesType || p.diabetes_type || '2型';
+  // diagnosis_date alias
+  p.diagnosis_date = p.diagnosisDate || p.diagnosis_date || '';
+  // glucose_records from glucoseHistory
+  if (p.glucoseHistory && p.glucoseHistory.length > 0 && (!p.glucose_records || p.glucose_records.length === 0)) {
+    p.glucose_records = p.glucoseHistory.map((g) => ({
+      timestamp: g.timestamp,
+      type: g.type,
+      value: g.value,
+      status: g.note || '',
+    }));
+  }
+  // current_medications from medications (string[])
+  if (p.medications && p.medications.length > 0 && (!p.current_medications || p.current_medications.length === 0)) {
+    p.current_medications = p.medications.map((med) => {
+      // Parse "二甲双胍 500mg bid" format
+      const parts = med.split(/\s+/);
+      return {
+        name: parts[0] || med,
+        dosage: parts[1] || '',
+        frequency: parts[2] || '',
+      };
+    });
+  }
+  return p;
+}

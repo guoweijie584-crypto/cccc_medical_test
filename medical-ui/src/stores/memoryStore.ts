@@ -71,11 +71,21 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
 
     set({ loading: true, error: null, degraded: false });
     try {
-      const data = await api.get<{ tree: MemoryNode[]; memoryStatus?: string }>(
+      const data = await api.get<{ tree: MemoryNode | MemoryNode[]; memoryStatus?: string }>(
         `/api/memory/tree/${patientId}`,
       );
+      // Backend returns { tree: { path, children } } (single object) or { tree: [...] } (array)
+      let treeNodes: MemoryNode[];
+      if (Array.isArray(data.tree)) {
+        treeNodes = data.tree;
+      } else if (data.tree && typeof data.tree === 'object') {
+        // Single root node — extract children
+        treeNodes = (data.tree as MemoryNode).children || [data.tree as MemoryNode];
+      } else {
+        treeNodes = [];
+      }
       set({
-        memories: flattenTree(data.tree || []),
+        memories: flattenTree(treeNodes),
         loading: false,
         degraded: data.memoryStatus === 'degraded',
       });

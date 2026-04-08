@@ -229,18 +229,29 @@ class EvaluationService:
 
     def get_pending_evaluations(self, limit: int = 20) -> List[HumanEvaluation]:
         """Get pending evaluations for doctors to review."""
+        # Try search first, then fall back to local cache
         results = self.client.search(
-            query="evaluation pending",
+            query="pending status evaluation patient query response",
             max_results=limit,
+            mode="keyword",
             path_prefix="evaluations/pending",
         )
         evaluations = []
+        seen_ids: set = set()
         for item in results:
             content = item.get("content", "")
             data = self._parse_content(content)
             if data and data.get("evaluation_id"):
-                evaluations.append(HumanEvaluation.from_dict(data))
-        return evaluations
+                eid = data["evaluation_id"]
+                if eid not in seen_ids:
+                    evaluations.append(HumanEvaluation.from_dict(data))
+                    seen_ids.add(eid)
+        # Also include local cache entries not found via search
+        for eid, ev in self._local_cache.items():
+            if ev.status == "pending" and eid not in seen_ids:
+                evaluations.append(ev)
+                seen_ids.add(eid)
+        return evaluations[:limit]
 
     def get_evaluation(self, evaluation_id: str) -> Optional[HumanEvaluation]:
         """Get a single evaluation by ID."""
@@ -268,22 +279,32 @@ class EvaluationService:
         """Get aggregated evaluation statistics."""
         stats = EvaluationStats()
 
-        # Count pending
-        pending = self.client.search(
-            query="evaluation pending",
-            max_results=100,
-            path_prefix="evaluations/pending",
-        )
+        # Count pending — use keyword mode for reliable path-based matching
+        pending = self.get_pending_evaluations(limit=100)
+        if patient_id:
+            pending = [e for e in pending if e.patient_id == patient_id]
         stats.pending = len(pending)
 
         # Count completed by label
         completed = self.client.search(
-            query="evaluation completed",
+            query="GOOD BAD NEUTRAL ERROR label evaluation",
             max_results=100,
+            mode="keyword",
             path_prefix="evaluations/completed",
         )
+        # Also check local cache for completed evaluations
+        completed_data = []
+        seen_ids: set = set()
         for item in completed:
             data = self._parse_content(item.get("content", ""))
+            if data and data.get("evaluation_id"):
+                completed_data.append(data)
+                seen_ids.add(data["evaluation_id"])
+        for eid, ev in self._local_cache.items():
+            if ev.status == "completed" and eid not in seen_ids:
+                completed_data.append(ev.to_dict())
+                seen_ids.add(eid)
+        for data in completed_data:
             if not data:
                 continue
             if patient_id and data.get("patient_id") != patient_id:

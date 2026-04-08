@@ -672,12 +672,16 @@ async def api_create_pending_evaluation(request: CreatePendingEvaluationRequest)
 
 @app.get("/api/evaluations/pending")
 async def api_get_pending_evaluations(
+    patient_id: str = Query(default="", description="Filter by patient ID"),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> Dict[str, Any]:
     """Get pending evaluations for doctors to review."""
     service = get_evaluation_service()
     try:
         evaluations = service.get_pending_evaluations(limit=limit)
+        # Filter by patient_id if provided
+        if patient_id:
+            evaluations = [e for e in evaluations if e.patient_id == patient_id]
         return {
             "evaluations": [e.to_dict() for e in evaluations],
             "count": len(evaluations),
