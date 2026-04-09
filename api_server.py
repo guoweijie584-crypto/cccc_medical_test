@@ -51,6 +51,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register extra routes (trace list, admin errors)
+try:
+    from api_extra_routes import register_extra_routes
+    register_extra_routes(app)
+except Exception:
+    pass  # non-critical
+
 
 class ConsultationRequest(BaseModel):
     patient_id: str
@@ -925,4 +932,6 @@ async def api_health() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
+    from api_extra_routes import register_extra_routes
+    register_extra_routes(app)
     uvicorn.run(app, host="0.0.0.0", port=8001)

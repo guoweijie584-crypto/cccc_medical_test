@@ -17,14 +17,19 @@ URI scheme:
 from __future__ import annotations
 
 import json
+import logging
 import re
+import uuid
+import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from config.settings import PROJECT_ROOT, prompt_path_for
 from .palace_client import MemoryPalaceClient
+
+logger = logging.getLogger(__name__)
 
 
 # ── URI helpers ─────────────────────────────────────────────────────
@@ -458,6 +463,83 @@ class MemoryAgent:
 
         return facts
 
+    # ── Conflict detection ────────────────────────────────────────
+
+    # Time window for considering two records as potential conflicts
+    _CONFLICT_WINDOW_HOURS: int = 24
+
+    def _check_conflict(
+        self,
+        patient_id: str,
+        new_record: MemoryRecord,
+    ) -> Optional[List[str]]:
+        """检查新记忆是否与已有记忆冲突。
+
+        搜索同 patient_id + 同 category 的近期记忆，
+        比较内容是否矛盾（同类型、不同内容、时间间隔短）。
+
+        Returns:
+            冲突的记忆 URI 列表；None 表示无冲突。
+        """
+        try:
+            # Search for recent memories of the same category for this patient
+            path_prefix = f"patients/{patient_id}"
+            existing_memories = self.client.search(
+                query=new_record.content,
+                max_results=5,
+                mode="hybrid",
+                path_prefix=path_prefix,
+            )
+
+            if not existing_memories:
+                return None
+
+            conflict_uris: List[str] = []
+
+            for mem in existing_memories:
+                parsed = self._parse_content(mem.get("content"))
+                existing_category = parsed.get("category", "")
+                existing_content = parsed.get("content", "")
+                existing_timestamp_str = parsed.get("timestamp", "")
+
+                # Only compare within the same category
+                if existing_category != new_record.category:
+                    continue
+
+                # Skip if content is identical (not a conflict, just a duplicate)
+                if existing_content == new_record.content:
+                    continue
+
+                # Skip if there's no existing content to compare
+                if not existing_content:
+                    continue
+
+                # Check if within conflict time window
+                if existing_timestamp_str and new_record.timestamp:
+                    try:
+                        existing_ts = datetime.fromisoformat(existing_timestamp_str)
+                        new_ts = datetime.fromisoformat(new_record.timestamp)
+                        time_diff = abs((new_ts - existing_ts).total_seconds())
+                        if time_diff > self._CONFLICT_WINDOW_HOURS * 3600:
+                            continue  # Too old — not a conflict, just an update
+                    except (ValueError, TypeError):
+                        pass  # If timestamps can't be parsed, still check content
+
+                # Same category, different content, within time window → conflict
+                mem_uri = mem.get("uri", "")
+                if not mem_uri:
+                    mem_path = parsed.get("path", "")
+                    if mem_path:
+                        mem_uri = f"{self.client.domain}://{mem_path}"
+                if mem_uri:
+                    conflict_uris.append(mem_uri)
+
+            return conflict_uris if conflict_uris else None
+
+        except Exception as exc:
+            logger.warning("Conflict check failed (non-critical): %s", exc)
+            return None  # Fail open: allow writes if conflict check fails
+
     def extract_and_store(
         self,
         patient_id: str,
@@ -465,6 +547,9 @@ class MemoryAgent:
         extracted_facts: Union[List[MemoryRecord], List[Dict[str, str]], List[str]],
     ) -> List[str]:
         """Store extracted facts as individual memories in Memory Palace.
+
+        在写入前执行冲突检测：如果发现冲突，在新记录的 conflict_with
+        字段中标注冲突 URI，而不是覆盖旧记录。
 
         向后兼容：extracted_facts 可以是：
           - List[MemoryRecord]  — 新格式（推荐）
@@ -480,6 +565,17 @@ class MemoryAgent:
         for i, record in enumerate(records):
             category = record.category
             path = _patient_path(patient_id, category, f"{ts}_{i}")
+
+            # ── Conflict detection before write ──
+            conflict_uris = self._check_conflict(patient_id, record)
+            if conflict_uris:
+                # Annotate the new record with conflict references instead of overwriting
+                record.conflict_with = conflict_uris
+                logger.info(
+                    "Memory conflict detected for patient %s, category=%s: "
+                    "new record conflicts with %s",
+                    patient_id, category, conflict_uris,
+                )
 
             # Map importance to priority
             priority_map = {
@@ -549,20 +645,109 @@ class MemoryAgent:
                 ))
         return records
 
-    def update_patient_profile(self, patient_id: str, updates: Dict[str, Any]) -> bool:
-        """Update a patient's profile in Memory Palace."""
+    def update_patient_profile(
+        self,
+        patient_id: str,
+        updates: Dict[str, Any],
+    ) -> Union[bool, Dict[str, Any]]:
+        """Update a patient's profile in Memory Palace.
+
+        逐字段比较，记录哪些字段被更新、哪些被标记为冲突。
+        向后兼容：仍然返回 bool（成功/失败），但内部会记录
+        冲突信息到 profile 的 _field_conflicts 元数据中。
+
+        对于全新的 profile（无已有记录），行为与旧版完全相同。
+
+        Returns:
+            True/False for backward compat.  Internally, field-level
+            conflict details are persisted in the profile's
+            ``_field_conflicts`` and ``_update_log`` keys.
+        """
         path = _patient_path(patient_id, "profile")
         existing = self.client.read(path)
 
         if existing and existing.get("content") is not None:
             current = self._parse_content(existing["content"])
-            current.update(updates)
-            current["last_updated"] = datetime.now().isoformat()
+            now_iso = datetime.now().isoformat()
+
+            # ── Field-level comparison ────────────────────────────
+            updated_fields: List[str] = []
+            conflict_fields: Dict[str, Dict[str, Any]] = {}  # field → {old, new}
+
+            # Preserve existing conflict log
+            field_conflicts = dict(current.get("_field_conflicts") or {})
+            update_log: List[Dict[str, Any]] = list(current.get("_update_log") or [])
+
+            for key, new_value in updates.items():
+                if key.startswith("_"):
+                    # Skip internal metadata keys
+                    continue
+                old_value = current.get(key)
+
+                if old_value is None or old_value == "" or old_value == {} or old_value == []:
+                    # Field was empty — safe to set
+                    current[key] = new_value
+                    updated_fields.append(key)
+                elif old_value == new_value:
+                    # No change — skip
+                    continue
+                else:
+                    # Field has a different existing value → conflict
+                    conflict_fields[key] = {
+                        "old_value": old_value,
+                        "new_value": new_value,
+                        "detected_at": now_iso,
+                    }
+                    # Store conflict info but STILL apply the update
+                    # (the new value is more recent, but we keep a record)
+                    field_conflicts[key] = {
+                        "old_value": old_value,
+                        "new_value": new_value,
+                        "detected_at": now_iso,
+                        "status": "auto_updated",  # vs. "needs_review" for sensitive fields
+                    }
+                    current[key] = new_value
+                    updated_fields.append(key)
+
+            # For sensitive medical fields, mark conflicts as needing review
+            _SENSITIVE_FIELDS = {
+                "诊断", "糖尿病类型", "并发症", "药物过敏",
+                "当前用药", "medications", "diagnosis", "type",
+            }
+            for fld in conflict_fields:
+                if fld in _SENSITIVE_FIELDS and fld in field_conflicts:
+                    field_conflicts[fld]["status"] = "needs_review"
+
+            # Record this update in the log
+            if updated_fields or conflict_fields:
+                log_entry: Dict[str, Any] = {
+                    "timestamp": now_iso,
+                    "updated_fields": updated_fields,
+                }
+                if conflict_fields:
+                    log_entry["conflicts"] = conflict_fields
+                update_log.append(log_entry)
+                # Keep only the last 20 log entries to avoid unbounded growth
+                update_log = update_log[-20:]
+
+            current["_field_conflicts"] = field_conflicts
+            current["_update_log"] = update_log
+            current["last_updated"] = now_iso
+
+            if conflict_fields:
+                logger.info(
+                    "Profile update for patient %s: %d field(s) updated, "
+                    "%d conflict(s) detected: %s",
+                    patient_id, len(updated_fields),
+                    len(conflict_fields), list(conflict_fields.keys()),
+                )
+
             result = self.client.update(
                 path=path,
                 content=json.dumps(current, ensure_ascii=False),
             )
         else:
+            # No existing profile — create fresh (no conflicts possible)
             profile = {**updates, "last_updated": datetime.now().isoformat()}
             result = self.client.create(
                 path=path,

@@ -6,6 +6,8 @@ const navItems = [
   { path: '/', icon: '💬', label: '对话', title: 'AI 对话咨询' },
   { path: '/memory', icon: '🏛️', label: '记忆', title: '记忆宫殿' },
   { path: '/evaluation', icon: '📋', label: '评价', title: '评价管理' },
+  { path: '/traces', icon: '🔍', label: 'Trace 审阅', title: 'Trace 审阅' },
+  { path: '/admin', icon: '⚙️', label: '系统管理', title: '系统管理' },
   { path: '/profile', icon: '👤', label: '档案', title: '患者档案' },
 ];
 

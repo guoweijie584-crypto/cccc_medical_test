@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
 
-import { EvolutionReport } from "./EvolutionReport";
+import { ConsultationPanel } from "./ConsultationPanel";
 import { EvaluationView } from "./EvaluationView";
-import { LlmConfigPanel } from "./LlmConfigPanel";
 import { MemoryPalaceView } from "./MemoryPalaceView";
-import { NativeDashboard } from "./NativeDashboard";
 import { PatientDetail } from "./PatientDetail";
 import { PatientList } from "./PatientList";
+import { SystemAdminPanel } from "./SystemAdminPanel";
+import { TraceReviewPanel } from "./TraceReviewPanel";
 import { medicalApiUrl } from "./api";
 import { useGroupStore, useMedicalStore } from "../../stores";
 
@@ -46,10 +46,26 @@ interface MedicalTabProps {
   isVisible: boolean;
 }
 
-type MedicalView = "dashboard" | "list" | "detail" | "evolution" | "config" | "memory" | "evaluation";
+type MedicalView = "consultation" | "trace" | "memory" | "evaluation" | "admin";
+
+const NAV_ITEMS: { key: MedicalView; icon: string; label: string }[] = [
+  { key: "consultation", icon: "\uD83D\uDCAC", label: "\u5BF9\u8BDD\u54A8\u8BE2" },
+  { key: "trace",        icon: "\uD83D\uDD0D", label: "Trace \u5BA1\u9605" },
+  { key: "memory",       icon: "\uD83C\uDFDB\uFE0F", label: "\u8BB0\u5FC6\u6CBB\u7406" },
+  { key: "evaluation",   icon: "\uD83D\uDCCB", label: "\u4EBA\u5DE5\u8BC4\u4EF7" },
+  { key: "admin",        icon: "\u2699\uFE0F", label: "\u7CFB\u7EDF\u7BA1\u7406" },
+];
+
+const SUBTITLE_MAP: Record<MedicalView, string> = {
+  consultation: "\u5BF9\u8BDD\u54A8\u8BE2",
+  trace: "Trace \u5BA1\u9605",
+  memory: "\u8BB0\u5FC6\u5BAB\u6BBF",
+  evaluation: "\u4EBA\u5DE5\u8BC4\u4EF7",
+  admin: "\u7CFB\u7EDF\u7BA1\u7406",
+};
 
 export function MedicalTab({ isDark, isVisible }: MedicalTabProps) {
-  const [activeView, setActiveView] = useState<MedicalView>("dashboard");
+  const [activeView, setActiveView] = useState<MedicalView>("consultation");
   const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
   const [patients, setPatients] = useState<Patient[]>([]);
   const [loading, setLoading] = useState(true);
@@ -78,116 +94,100 @@ export function MedicalTab({ isDark, isVisible }: MedicalTabProps) {
       }
     };
     fetchPatients();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [isVisible]);
 
   if (!isVisible) return null;
 
-  const subtitleMap: Record<MedicalView, string> = {
-    dashboard: "CCCC-native 看板",
-    list: "患者列表",
-    detail: selectedPatient?.name || "患者详情",
-    evolution: "评测/优化看板",
-    config: "API / Actor 配置",
-    memory: "记忆宫殿",
-    evaluation: "人工评价",
+  const handleSelectPatient = (patient: Patient) => {
+    setSelectedPatient(patient);
+    if (selectedGroupId) {
+      setSelectedPatientBinding(selectedGroupId, {
+        patientId: patient.id,
+        patientName: patient.name,
+        age: patient.age,
+        gender: patient.gender,
+        diabetesType: patient.diabetesType,
+        diagnosisDate: patient.diagnosisDate,
+        medications: patient.medications,
+        complications: patient.complications,
+        glucoseRecent: patient.glucoseHistory.slice(-5),
+      });
+    }
   };
 
   return (
     <div className={`flex-1 flex flex-col min-h-0 ${isDark ? "bg-slate-900" : "bg-gray-50"}`}>
-      <div className="glass-header flex items-center justify-between px-4 py-3">
-        <div className="flex items-center gap-3">
-          <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">血糖管理</h2>
-          <span className="text-sm text-[var(--color-text-tertiary)]">{subtitleMap[activeView]}</span>
+      {/* Header + Navigation */}
+      <div className="glass-header px-4 py-3">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">
+              {"\u8840\u7CD6\u7BA1\u7406\u591A\u667A\u80FD\u4F53\u7CFB\u7EDF"}
+            </h2>
+            <span className="text-sm text-[var(--color-text-tertiary)]">
+              {SUBTITLE_MAP[activeView]}
+            </span>
+          </div>
         </div>
-
-        <div className="flex items-center gap-2">
-          {activeView !== "dashboard" && (
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {NAV_ITEMS.map((item) => (
             <button
+              key={item.key}
               onClick={() => {
-                setSelectedPatient(null);
-                setActiveView("dashboard");
+                if (item.key === "consultation") setSelectedPatient(null);
+                setActiveView(item.key);
               }}
-              className="glass-btn px-3 py-1.5 text-sm rounded-lg"
+              className={`glass-btn px-3 py-1.5 text-sm rounded-lg transition-all ${
+                activeView === item.key ? "glass-tab-active" : ""
+              }`}
             >
-              返回看板
+              {item.icon} {item.label}
             </button>
-          )}
-          <button
-            onClick={() => setActiveView("memory")}
-            className={`glass-btn px-3 py-1.5 text-sm rounded-lg ${activeView === "memory" ? "glass-tab-active" : ""}`}
-          >
-            🏛️ 记忆
-          </button>
-          <button
-            onClick={() => setActiveView("evaluation")}
-            className={`glass-btn px-3 py-1.5 text-sm rounded-lg ${activeView === "evaluation" ? "glass-tab-active" : ""}`}
-          >
-            📋 评价
-          </button>
-          <button
-            onClick={() => setActiveView("list")}
-            className={`glass-btn px-3 py-1.5 text-sm rounded-lg ${activeView === "list" ? "glass-tab-active" : ""}`}
-          >
-            患者
-          </button>
-          <button
-            onClick={() => setActiveView("evolution")}
-            className={`glass-btn px-3 py-1.5 text-sm rounded-lg ${activeView === "evolution" ? "glass-tab-active" : ""}`}
-          >
-            评测
-          </button>
-          <button
-            onClick={() => setActiveView("config")}
-            className={`glass-btn px-3 py-1.5 text-sm rounded-lg ${activeView === "config" ? "glass-tab-active" : ""}`}
-          >
-            配置
-          </button>
+          ))}
         </div>
       </div>
 
+      {/* Content */}
       <div className="flex-1 overflow-auto p-4">
-        {loading && activeView === "list" ? (
-          <div className="flex items-center justify-center h-full text-[var(--color-text-secondary)]">加载中...</div>
-        ) : error && activeView === "list" ? (
-          <div className="flex items-center justify-center h-full text-red-500">{error}</div>
-        ) : activeView === "dashboard" ? (
-          <NativeDashboard isDark={isDark} />
-        ) : activeView === "list" ? (
-          <PatientList
-            patients={patients}
-            onSelectPatient={(patient) => {
-              setSelectedPatient(patient);
-              if (selectedGroupId) {
-                setSelectedPatientBinding(selectedGroupId, {
-                  patientId: patient.id,
-                  patientName: patient.name,
-                  age: patient.age,
-                  gender: patient.gender,
-                  diabetesType: patient.diabetesType,
-                  diagnosisDate: patient.diagnosisDate,
-                  medications: patient.medications,
-                  complications: patient.complications,
-                  glucoseRecent: patient.glucoseHistory.slice(-5),
-                });
-              }
-              setActiveView("detail");
-            }}
-            isDark={isDark}
-          />
-        ) : activeView === "detail" && selectedPatient ? (
-          <PatientDetail patient={selectedPatient} isDark={isDark} />
+        {activeView === "consultation" ? (
+          loading ? (
+            <div className="flex items-center justify-center h-full text-[var(--color-text-secondary)]">{"\u52A0\u8F7D\u4E2D..."}</div>
+          ) : error ? (
+            <div className="flex items-center justify-center h-full text-red-500">{error}</div>
+          ) : !selectedPatient ? (
+            <PatientList
+              patients={patients}
+              onSelectPatient={handleSelectPatient}
+              isDark={isDark}
+            />
+          ) : (
+            <div className="space-y-4">
+              <button
+                onClick={() => setSelectedPatient(null)}
+                className="glass-btn px-3 py-1.5 text-sm rounded-lg"
+              >
+                {"\u2190 \u8FD4\u56DE\u60A3\u8005\u5217\u8868"}
+              </button>
+              <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                <div className="xl:col-span-2">
+                  <ConsultationPanel patient={selectedPatient} isDark={isDark} />
+                </div>
+                <div className="xl:col-span-1">
+                  <PatientDetail patient={selectedPatient} isDark={isDark} />
+                </div>
+              </div>
+            </div>
+          )
+        ) : activeView === "trace" ? (
+          <TraceReviewPanel isDark={isDark} />
         ) : activeView === "memory" ? (
           <MemoryPalaceView isDark={isDark} />
         ) : activeView === "evaluation" ? (
           <EvaluationView isDark={isDark} />
-        ) : activeView === "evolution" ? (
-          <EvolutionReport isDark={isDark} />
-        ) : (
-          <LlmConfigPanel isDark={isDark} />
-        )}
+        ) : activeView === "admin" ? (
+          <SystemAdminPanel isDark={isDark} />
+        ) : null}
       </div>
     </div>
   );

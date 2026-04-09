@@ -23,6 +23,8 @@ class ConsultationTrace:
     # 输入
     original_query: str
     rewritten_query: Optional[str] = None  # Coordinator 重述后的问题
+    query_type: Optional[str] = None  # 问题分类: medication/diet/exercise/glucose/complication/general/emergency
+    routing_decision: Optional[Dict[str, Any]] = None  # 路由决策详情
 
     # 记忆上下文
     retrieved_memory_keys: List[str] = field(default_factory=list)  # 检索到的记忆 URI

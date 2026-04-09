@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -20,6 +21,8 @@ from .safety_reviewer import (
 from .trace import ConsultationTrace, generate_trace_id, generate_request_id
 from ..llm_client import get_llm_client
 from ..memory import get_memory_agent
+
+logger = logging.getLogger(__name__)
 
 
 # 安全降级 fallback 回复
@@ -40,6 +43,40 @@ _SAFETY_CAUTION_TEMPLATE = (
 class GlucoseManagementWorkflow:
     """Orchestrates memory retrieval, specialist reasoning, synthesis, and memory write-back."""
 
+    # ── Query classification rules (mock mode) ────────────────────
+    _CLASSIFICATION_RULES: List[Dict[str, Any]] = [
+        {
+            "keywords": ("低血糖", "急", "严重", "酮症", "酮症酸中毒", "DKA", "昏迷", "意识"),
+            "query_type": "emergency",
+            "needs_specialists": ["pharmacist", "nutritionist", "doctor"],
+        },
+        {
+            "keywords": ("药", "胰岛素", "二甲双胍", "格列", "阿卡波糖", "用药", "剂量", "处方"),
+            "query_type": "medication",
+            "needs_specialists": ["pharmacist", "doctor"],
+        },
+        {
+            "keywords": ("吃", "饮食", "水果", "碳水", "早餐", "午餐", "晚餐", "食物", "GI", "食谱"),
+            "query_type": "diet",
+            "needs_specialists": ["nutritionist"],
+        },
+        {
+            "keywords": ("运动", "锻炼", "步行", "跑步", "健身", "有氧", "散步"),
+            "query_type": "exercise",
+            "needs_specialists": ["nutritionist", "doctor"],
+        },
+        {
+            "keywords": ("血糖", "mmol", "监测", "空腹", "餐后"),
+            "query_type": "glucose",
+            "needs_specialists": ["doctor"],
+        },
+        {
+            "keywords": ("并发症", "肾", "眼底", "足", "神经", "视网膜"),
+            "query_type": "complication",
+            "needs_specialists": ["doctor"],
+        },
+    ]
+
     def __init__(self, use_mock: bool = True, llm_client=None) -> None:
         self.use_mock = bool(use_mock)
         self.llm_client = llm_client or get_llm_client()
@@ -58,6 +95,93 @@ class GlucoseManagementWorkflow:
             self.nutritionist = NutritionistAgent(self.llm_client)
             self.doctor = DoctorAgent(self.llm_client)
             self.safety_reviewer = SafetyReviewerAgent(self.llm_client)
+
+    # ── Coordinator: query rewriting & classification ─────────────
+
+    def _rewrite_query(self, original_query: str, patient_context: str) -> Dict[str, Any]:
+        """Coordinator 重述问题：规范化、消歧、分类。
+
+        Returns:
+            {
+                "rewritten_query": str,   # 规范化后的查询
+                "query_type": str,        # medication/diet/exercise/glucose/complication/general/emergency
+                "needs_specialists": list, # ["pharmacist","nutritionist","doctor"] 的子集
+            }
+        """
+        if self.use_mock:
+            return self._rewrite_query_mock(original_query)
+        return self._rewrite_query_llm(original_query, patient_context)
+
+    def _rewrite_query_mock(self, original_query: str) -> Dict[str, Any]:
+        """Mock 模式：用关键词匹配做简单分类。"""
+        # 按优先级匹配规则（emergency 最先）
+        for rule in self._CLASSIFICATION_RULES:
+            if any(kw in original_query for kw in rule["keywords"]):
+                return {
+                    "rewritten_query": original_query,
+                    "query_type": rule["query_type"],
+                    "needs_specialists": list(rule["needs_specialists"]),
+                }
+        # 无匹配 → general → 需要所有专家
+        return {
+            "rewritten_query": original_query,
+            "query_type": "general",
+            "needs_specialists": ["pharmacist", "nutritionist", "doctor"],
+        }
+
+    def _rewrite_query_llm(self, original_query: str, patient_context: str) -> Dict[str, Any]:
+        """LLM 模式：使用 LLM 做问题重述和分类。"""
+        prompt = (
+            "你是一个糖尿病管理系统的 Coordinator。请对以下患者问题进行重述和分类。\n\n"
+            f"## 患者上下文\n{patient_context}\n\n"
+            f"## 原始问题\n{original_query}\n\n"
+            "请返回严格的 JSON 格式（不要其他文字）：\n"
+            "{\n"
+            '  "rewritten_query": "规范化后的问题（消除歧义、补充上下文、简洁明确）",\n'
+            '  "query_type": "medication|diet|exercise|glucose|complication|general|emergency 之一",\n'
+            '  "needs_specialists": ["需要咨询的专家列表，可选 pharmacist/nutritionist/doctor"]\n'
+            "}\n\n"
+            "分类规则：\n"
+            "- medication: 涉及药物、胰岛素、剂量调整\n"
+            "- diet: 涉及饮食、食物选择、碳水控制\n"
+            "- exercise: 涉及运动、锻炼\n"
+            "- glucose: 涉及血糖监测、血糖数值解读\n"
+            "- complication: 涉及并发症\n"
+            "- emergency: 涉及低血糖急救、酮症酸中毒等紧急情况\n"
+            "- general: 其他一般性咨询\n"
+            "注意：emergency 类型必须路由到所有三个专家。"
+        )
+
+        try:
+            result = self.llm_client.json_completion_sync(
+                messages=[
+                    {"role": "system", "content": "你是糖尿病管理系统的问题分类器。只输出 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=500,
+            )
+            # Validate and provide defaults
+            rewritten = str(result.get("rewritten_query", "")).strip() or original_query
+            query_type = str(result.get("query_type", "general")).strip()
+            valid_types = {"medication", "diet", "exercise", "glucose", "complication", "general", "emergency"}
+            if query_type not in valid_types:
+                query_type = "general"
+            needs = result.get("needs_specialists", [])
+            valid_specialists = {"pharmacist", "nutritionist", "doctor"}
+            needs = [s for s in needs if s in valid_specialists]
+            if not needs or query_type == "emergency":
+                needs = ["pharmacist", "nutritionist", "doctor"]
+            return {
+                "rewritten_query": rewritten,
+                "query_type": query_type,
+                "needs_specialists": needs,
+            }
+        except Exception as exc:
+            logger.warning("LLM query rewriting failed, falling back to mock: %s", exc)
+            return self._rewrite_query_mock(original_query)
+
+    # ── Main query processing ────────────────────────────────────
 
     def process_patient_query(
         self,
@@ -104,19 +228,40 @@ class GlucoseManagementWorkflow:
                     trace.retrieved_memory_keys.append(uri)
         trace.memory_dossier_summary = str(context.get("summary", ""))
 
-        # ── Step 2: Expert consultation ────────────────────────────
+        # ── Step 1.5: Coordinator query rewrite & classification ──
+        rewrite_result = self._rewrite_query(query, context)
+        effective_query = rewrite_result["rewritten_query"]
+        query_type = rewrite_result["query_type"]
+        needs_specialists = rewrite_result["needs_specialists"]
+
+        trace.rewritten_query = effective_query
+        trace.query_type = query_type
+        trace.routing_decision = {
+            "query_type": query_type,
+            "needs_specialists": needs_specialists,
+            "original_query": query,
+            "rewritten_query": effective_query,
+        }
+
+        # ── Step 2: Expert consultation (dynamic routing) ─────────
         t_experts_start = time.perf_counter()
         expert_outputs: Dict[str, Any] = {}
-        expert_agents = {
+        all_expert_agents = {
             "pharmacist": self.pharmacist,
             "nutritionist": self.nutritionist,
             "doctor": self.doctor,
+        }
+        # Only route to needed specialists
+        expert_agents = {
+            name: agent
+            for name, agent in all_expert_agents.items()
+            if name in needs_specialists
         }
 
         if enable_parallel:
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = {
-                    name: executor.submit(agent.process_sync, context, query)
+                    name: executor.submit(agent.process_sync, context, effective_query)
                     for name, agent in expert_agents.items()
                 }
                 for name, future in futures.items():
@@ -133,7 +278,7 @@ class GlucoseManagementWorkflow:
         else:
             for name, agent in expert_agents.items():
                 try:
-                    expert_outputs[name] = agent.process_sync(context, query)
+                    expert_outputs[name] = agent.process_sync(context, effective_query)
                     trace.routed_agents.append(name)
                 except Exception as exc:
                     trace.errors.append({

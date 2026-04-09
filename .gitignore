@@ -76,3 +76,4 @@ cccc_medical-main/src/cccc/ports/web/dist/
 # Optional: large local datasets (keep only if intentionally public)
 Memory-Palace-main/backend/tests/datasets/raw/
 Memory-Palace-main/backend/tests/datasets/processed/
+Memory-Palace-main/data/
