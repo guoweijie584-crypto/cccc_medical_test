@@ -596,24 +596,43 @@ async def api_get_memory_stats(
 
 @app.post("/api/consultation")
 async def api_create_consultation(request: ConsultationRequest) -> Dict[str, Any]:
-    """DEPRECATED: Use CCCC work group API instead.
+    """Run a multi-agent consultation for a patient query.
 
-    The multi-agent consultation now runs through the CCCC work group
-    (glucose-management-main / g_72244ae16d48) via:
-      POST /api/v1/groups/g_72244ae16d48/send
-      GET  /api/v1/groups/g_72244ae16d48/ledger/stream  (SSE)
-
-    This endpoint is kept as a compatibility stub.
+    Full pipeline: Coordinator rewrite -> Memory retrieval -> Expert routing
+    -> Safety review -> Synthesis -> Memory writeback -> Trace generation
     """
-    from fastapi.responses import JSONResponse
-    return JSONResponse(
-        status_code=410,
-        content={
-            "error": "此接口已废弃。会诊功能已迁移至 CCCC 工作组。",
-            "migration": "POST /api/v1/groups/g_72244ae16d48/send",
-            "docs": "前端已自动使用新的 CCCC 协作 API。",
-        },
+    patient_id = request.patient_id
+    query = request.query
+
+    # Ensure patient profile is loaded into Memory Palace
+    try:
+        patient = get_patient_by_id(patient_id)
+        memory_agent = get_memory_agent()
+        _safe_update_patient_profile(memory_agent, patient_id, patient)
+    except Exception:
+        pass  # non-critical: consultation can proceed without full profile
+
+    # Run the multi-agent workflow
+    workflow = get_workflow()
+    result = workflow.process_patient_query(
+        patient_id=patient_id,
+        query=query,
     )
+
+    # Auto-create pending evaluation record (online -> offline loop link)
+    try:
+        service = get_evaluation_service()
+        expert_opinions = result.get("expert_opinions") or {}
+        service.create_pending_evaluation(
+            patient_id=patient_id,
+            query=query,
+            response=result.get("primary_response", ""),
+            expert_opinions=expert_opinions,
+        )
+    except Exception:
+        pass  # evaluation creation is non-critical
+
+    return result
 
 
 # ── Evaluation API (Human Doctor Evaluation) ──────────────────────
