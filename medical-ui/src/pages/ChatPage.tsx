@@ -4,24 +4,42 @@ import { useChatStore } from '../stores/chatStore';
 import { usePatientStore } from '../stores/patientStore';
 import { MessageBubble } from '../components/chat/MessageBubble';
 import { MessageInput } from '../components/chat/MessageInput';
-import { AgentTyping } from '../components/chat/AgentTyping';
+import { ConsultationStatus } from '../components/chat/ConsultationStatus';
+import { SystemStatusBanner } from '../components/common/SystemStatusBanner';
 import { ErrorToast } from '../components/common/ErrorToast';
 
 export function ChatPage() {
-  const { messages, isLoading, error, sendMessage, loadMessages, clearMessages } = useChatStore();
+  const messages = useChatStore((s) => s.messages);
+  const isLoading = useChatStore((s) => s.isLoading);
+  const error = useChatStore((s) => s.error);
+  const activeRound = useChatStore((s) => s.activeRound);
+  const isConnected = useChatStore((s) => s.isConnected);
+  const { sendMessage, clearMessages, connect, disconnect, loadHistory } = useChatStore();
+
   const selectedPatientId = usePatientStore((s) => s.selectedPatientId);
   const patient = usePatientStore((s) => s.getSelectedPatient());
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  // Connect to CCCC SSE on mount
+  useEffect(() => {
+    connect();
+    loadHistory();
+    return () => disconnect();
+  }, [connect, disconnect, loadHistory]);
+
+  // Reload history when patient changes
   useEffect(() => {
     if (selectedPatientId) {
-      loadMessages(selectedPatientId);
+      // For now, we show all messages from the group ledger.
+      // Future: filter by patient_id binding
+      loadHistory();
     }
-  }, [selectedPatientId, loadMessages]);
+  }, [selectedPatientId, loadHistory]);
 
+  // Auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isLoading]);
+  }, [messages, isLoading, activeRound]);
 
   const handleSend = useCallback(
     async (query: string) => {
@@ -30,8 +48,15 @@ export function ChatPage() {
     [sendMessage],
   );
 
+  const isConsulting = activeRound != null
+    && activeRound.phase !== 'complete'
+    && activeRound.phase !== 'error';
+
   return (
     <div className="flex h-full flex-col">
+      {/* System health banner */}
+      <SystemStatusBanner />
+
       {/* Header bar */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-white/5">
         <div className="flex items-center gap-2 text-sm text-gray-400">
@@ -45,6 +70,17 @@ export function ChatPage() {
               <span>{patient.diabetes_type}</span>
             </>
           )}
+          {/* Connection indicator */}
+          <span className="ml-auto flex items-center gap-1 text-xs">
+            <span
+              className={`inline-block h-1.5 w-1.5 rounded-full ${
+                isConnected ? 'bg-green-400' : 'bg-red-400'
+              }`}
+            />
+            <span className={isConnected ? 'text-green-500' : 'text-red-400'}>
+              {isConnected ? '已连接' : '未连接'}
+            </span>
+          </span>
         </div>
         {messages.length > 0 && (
           <button
@@ -77,8 +113,11 @@ export function ChatPage() {
             </h2>
             <p className="text-gray-500 max-w-md leading-relaxed">
               {patient
-                ? `${patient.name}，您好！我是您的专属血糖管理助手。您可以问我关于血糖控制、用药、饮食、运动等问题。`
+                ? `${patient.name}，您好！我是您的专属血糖管理助手。多位AI专家将协作为您提供专业建议。`
                 : '请先在左侧选择患者，然后开始对话咨询。'}
+            </p>
+            <p className="text-xs text-gray-600 mt-2">
+              由 Claude Code 多 Agent 协作驱动
             </p>
             {patient && (
               <div className="mt-6 flex flex-wrap gap-2 justify-center">
@@ -105,7 +144,10 @@ export function ChatPage() {
           ))}
         </AnimatePresence>
 
-        <AnimatePresence>{isLoading && <AgentTyping />}</AnimatePresence>
+        {/* Multi-agent consultation progress */}
+        <AnimatePresence>
+          {isConsulting && <ConsultationStatus />}
+        </AnimatePresence>
 
         <div ref={messagesEndRef} />
       </div>
@@ -113,9 +155,15 @@ export function ChatPage() {
       {/* Input area */}
       <MessageInput
         onSend={handleSend}
-        disabled={!selectedPatientId}
-        isLoading={isLoading}
-        placeholder={selectedPatientId ? '输入您的健康问题...' : '请先选择患者'}
+        disabled={!selectedPatientId || isConsulting}
+        isLoading={isConsulting}
+        placeholder={
+          !selectedPatientId
+            ? '请先选择患者'
+            : isConsulting
+              ? '专家团队正在协作中...'
+              : '输入您的健康问题...'
+        }
       />
 
       <ErrorToast message={error} />

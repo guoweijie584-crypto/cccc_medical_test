@@ -77,7 +77,11 @@ export function EvolutionTrigger() {
             + {evolutionReport.memory_reinforcements} 个记忆强化
           </p>
           {evolutionReport.summary && (
-            <p className="text-gray-600">{evolutionReport.summary}</p>
+            <p className="text-gray-600">
+              {typeof evolutionReport.summary === 'string'
+                ? evolutionReport.summary
+                : JSON.stringify(evolutionReport.summary)}
+            </p>
           )}
         </div>
       )}

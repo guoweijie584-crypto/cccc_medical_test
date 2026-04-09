@@ -5,6 +5,8 @@ Requires=cccc-test-daemon.service
 
 [Service]
 Type=simple
+User=cccc
+Group=cccc
 ExecStart=/bin/bash -lc 'set -a; source /etc/cccc-test.env; cd "$PROJECT_ROOT"; exec "$VENV_DIR/bin/python" scripts/run_cccc_web.py --host "$CCCC_WEB_HOST" --port "$CCCC_WEB_PORT"'
 Restart=on-failure
 RestartSec=2

@@ -4,6 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
+User=cccc
+Group=cccc
 ExecStart=/bin/bash -lc 'set -a; source /etc/cccc-test.env; cd "$PROJECT_ROOT"; exec "$VENV_DIR/bin/python" scripts/run_cccc_daemon.py'
 Restart=on-failure
 RestartSec=2

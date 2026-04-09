@@ -14,6 +14,27 @@ export interface MemoryNode {
   children?: MemoryNode[];
 }
 
+/** Safely stringify content — backend may return object or string */
+export function safeContentString(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (content && typeof content === 'object') {
+    try { return JSON.stringify(content); } catch { return String(content); }
+  }
+  return String(content ?? '');
+}
+
+/** Normalize a raw memory node from the API — ensures content is always a string */
+function normalizeMemoryNode(node: any): MemoryNode {
+  return {
+    ...node,
+    content: safeContentString(node.content),
+    category: node.category || 'general',
+    priority: node.priority ?? 3,
+    vitality: node.vitality ?? 0.5,
+    children: node.children ? node.children.map(normalizeMemoryNode) : undefined,
+  };
+}
+
 export interface MemoryStats {
   total: number;
   by_category: Record<string, number>;
@@ -84,8 +105,10 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
       } else {
         treeNodes = [];
       }
+      // Normalize all nodes — ensure content is string, fill defaults
+      const normalized = treeNodes.map(normalizeMemoryNode);
       set({
-        memories: flattenTree(treeNodes),
+        memories: flattenTree(normalized),
         loading: false,
         degraded: data.memoryStatus === 'degraded',
       });
@@ -116,7 +139,9 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
       const data = await api.get<{ results: MemoryNode[] }>(
         `/api/memory/search?q=${encodeURIComponent(query)}&patient_id=${patientId}&mode=hybrid`,
       );
-      set({ searchResults: data.results || [] });
+      // Normalize search results — content may be object
+      const normalized = (data.results || []).map(normalizeMemoryNode);
+      set({ searchResults: normalized });
     } catch {
       set({ searchResults: [] });
     }
