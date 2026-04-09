@@ -3,7 +3,7 @@ Primary Agent - 主治医生 Agent
 """
 
 from typing import Dict, Any, Optional
-from .base_agent import BaseAgent, MockAgent
+from .base_agent import BaseAgent, MockAgent, StructuredExpertOutput
 
 
 class PrimaryAgent(BaseAgent):
@@ -26,17 +26,9 @@ class PrimaryAgent(BaseAgent):
     
     def process_sync(self, context: str, query: str, expert_opinions: Optional[Dict[str, str]] = None, **kwargs) -> Dict[str, Any]:
         """同步处理"""
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            # 如果在事件循环中，创建新线程运行
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, self.process(context, query, expert_opinions))
-                return future.result()
-        except RuntimeError:
-            # 没有事件循环，直接运行
-            return asyncio.run(self.process(context, query, expert_opinions))
+        prompt = self.build_full_prompt(context, query, expert_opinions)
+        response = self._call_llm_sync(prompt, temperature=0.7)
+        return self.format_response(response)
 
 
 class MockPrimaryAgent(MockAgent):

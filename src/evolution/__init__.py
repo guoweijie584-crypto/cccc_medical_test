@@ -20,6 +20,7 @@ from .evaluation_service import (
     EvaluationStats,
     get_evaluation_service,
     VALID_LABELS,
+    VALID_FAILURE_TAGS,
 )
 
 # Legacy (kept for backward compat, but deprecated)
@@ -41,6 +42,7 @@ __all__ = [
     "EvaluationStats",
     "get_evaluation_service",
     "VALID_LABELS",
+    "VALID_FAILURE_TAGS",
     # Legacy evaluator (deprecated)
     "EvaluatorAgent",
     "EvaluationReport",

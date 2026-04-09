@@ -103,6 +103,12 @@ AGENT_CONFIG = {
         "role": "Handles complication and disease-management reasoning.",
         "system_prompt_file": "prompts/metabolism_doctor.txt",
     },
+    "safety_reviewer": {
+        "name": "Safety Reviewer",
+        "name_zh": "安全审查员",
+        "role": "Reviews final responses for safety risks and escalation needs.",
+        "system_prompt_file": "prompts/safety_reviewer.txt",
+    },
     "memory": {
         "name": "Memory Agent",
         "name_zh": "记忆管理",

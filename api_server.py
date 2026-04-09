@@ -21,7 +21,7 @@ from config.settings import PATIENT_DATA_FILE
 from config.settings import mask_api_key, read_runtime_llm_settings, write_runtime_llm_settings
 from src.agents import GlucoseManagementWorkflow
 from src.evolution import EvaluatorAgent, build_ui_report, run_demo_evaluation
-from src.evolution import get_evaluation_service, VALID_LABELS
+from src.evolution import get_evaluation_service, VALID_LABELS, VALID_FAILURE_TAGS
 from src.evolution import HumanEvalEvolutionLoop
 from src.llm_client import get_llm_client
 from src.memory import get_memory_agent
@@ -102,6 +102,7 @@ class SubmitEvaluationRequest(BaseModel):
     advice_direction: Optional[str] = None
     reviewer_notes: str = ""
     reviewer_id: str = ""
+    failure_tags: List[str] = []
 
 
 _report_lock = threading.Lock()
@@ -588,60 +589,24 @@ async def api_get_memory_stats(
 
 @app.post("/api/consultation")
 async def api_create_consultation(request: ConsultationRequest) -> Dict[str, Any]:
-    patient = get_patient_by_id(request.patient_id)
-    llm_client = get_llm_client()
-    workflow = get_workflow()
-    memory_agent = get_memory_agent()
-    memory_error = _safe_update_patient_profile(memory_agent, request.patient_id, patient)
+    """DEPRECATED: Use CCCC work group API instead.
 
-    result = workflow.process_patient_query(
-        patient_id=request.patient_id,
-        query=request.query,
-        patient_context=patient,
-    )
-    evaluator = EvaluatorAgent(llm_client=llm_client if llm_client.available else None)
-    response_score = evaluator.evaluate_response(
-        patient_id=request.patient_id,
-        query=request.query,
-        response=str(result.get("primary_response") or ""),
-        expert_opinions=dict(result.get("expert_opinions") or {}),
-        patient_context=result.get("context") or {},
-        use_llm=llm_client.available,
-    )
-    response = {
-        "query": request.query,
-        "patientId": request.patient_id,
-        "primaryResponse": result.get("primary_response", ""),
-        "expertOpinions": {
-            "pharmacist": (result.get("expert_opinions") or {}).get("pharmacist", ""),
-            "nutritionist": (result.get("expert_opinions") or {}).get("nutritionist", ""),
-            "doctor": (result.get("expert_opinions") or {}).get("doctor", ""),
+    The multi-agent consultation now runs through the CCCC work group
+    (glucose-management-main / g_72244ae16d48) via:
+      POST /api/v1/groups/g_72244ae16d48/send
+      GET  /api/v1/groups/g_72244ae16d48/ledger/stream  (SSE)
+
+    This endpoint is kept as a compatibility stub.
+    """
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=410,
+        content={
+            "error": "此接口已废弃。会诊功能已迁移至 CCCC 工作组。",
+            "migration": "POST /api/v1/groups/g_72244ae16d48/send",
+            "docs": "前端已自动使用新的 CCCC 协作 API。",
         },
-        "evaluationScore": response_score.overall,
-        "scoreBreakdown": response_score.to_dict(),
-        "memories": _memory_briefs(result.get("context") or {}),
-        "mode": result.get("mode", "mock"),
-    }
-    if memory_error:
-        response["memoryStatus"] = "degraded"
-        response["memoryError"] = memory_error
-    else:
-        response["memoryStatus"] = "ok"
-
-    # Automatically create pending evaluation record (line1 → line3)
-    try:
-        eval_service = get_evaluation_service()
-        pending_eval = eval_service.create_pending_evaluation(
-            patient_id=request.patient_id,
-            query=request.query,
-            response=str(result.get("primary_response") or ""),
-            expert_opinions=dict(result.get("expert_opinions") or {}),
-        )
-        response["pendingEvaluationId"] = pending_eval.evaluation_id
-    except Exception:
-        pass  # Non-critical: don't fail consultation if evaluation creation fails
-
-    return response
+    )
 
 
 # ── Evaluation API (Human Doctor Evaluation) ──────────────────────
@@ -706,6 +671,7 @@ async def api_submit_evaluation(
             advice_direction=request.advice_direction,
             reviewer_notes=request.reviewer_notes,
             reviewer_id=request.reviewer_id,
+            failure_tags=request.failure_tags or None,
         )
         return {
             "status": "submitted",
@@ -746,6 +712,36 @@ async def api_get_bad_evaluations(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/evaluations/failure-tags")
+async def api_get_failure_tags() -> Dict[str, Any]:
+    """Return all valid failure classification tags."""
+    return {"failure_tags": sorted(VALID_FAILURE_TAGS)}
+
+
+@app.get("/api/traces/{trace_id}")
+async def api_get_trace(trace_id: str) -> Dict[str, Any]:
+    """Return a single consultation trace by trace_id."""
+    import json as _json
+
+    memory_agent = get_memory_agent()
+    client = memory_agent.client
+    path = f"traces/{trace_id}"
+    record = client.read(path)
+    if not record or "error" in record:
+        raise HTTPException(status_code=404, detail=f"Trace {trace_id} not found")
+
+    content = record.get("content")
+    if isinstance(content, str):
+        try:
+            content = _json.loads(content)
+        except (_json.JSONDecodeError, TypeError):
+            content = {"raw": content}
+    elif not isinstance(content, dict):
+        content = {}
+
+    return {"trace_id": trace_id, "trace": content}
 
 
 @app.get("/api/evaluations/{evaluation_id}")

@@ -6,12 +6,13 @@ No internal three-layer memory.
 """
 
 from .palace_client import MemoryPalaceClient, MemoryPalaceClientSync
-from .memory_agent import MemoryAgent, PatientMemory, Priority, get_memory_agent
+from .memory_agent import MemoryAgent, MemoryRecord, PatientMemory, Priority, get_memory_agent
 
 __all__ = [
     "MemoryPalaceClient",
     "MemoryPalaceClientSync",
     "MemoryAgent",
+    "MemoryRecord",
     "PatientMemory",
     "Priority",
     "get_memory_agent",

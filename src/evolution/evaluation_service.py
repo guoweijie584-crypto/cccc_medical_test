@@ -28,6 +28,20 @@ VALID_LABELS = {"GOOD", "BAD", "NEUTRAL", "ERROR"}
 VALID_SAFETY = {"safe", "risky", "dangerous"}
 VALID_ADVICE_DIRECTION = {"correct", "partial", "wrong"}
 
+VALID_FAILURE_TAGS = {
+    "safety_error",
+    "factual_error",
+    "personalization_miss",
+    "wrong_routing",
+    "memory_miss",
+    "stale_memory_use",
+    "conflict_not_resolved",
+    "overconfident_no_escalation",
+    "specialist_redundancy",
+    "synthesis_contradiction",
+    "poor_user_communication",
+}
+
 
 # ── Data structures ─────────────────────────────────────────────────
 
@@ -51,6 +65,10 @@ class HumanEvaluation:
     # Notes
     reviewer_notes: str = ""
     reviewer_id: str = ""
+
+    # Failure classification
+    failure_tags: List[str] = field(default_factory=list)  # 细分失败类型
+    trace_id: Optional[str] = None  # 关联的 trace
 
     # Metadata
     timestamp: str = ""             # when evaluation was submitted
@@ -166,6 +184,7 @@ class EvaluationService:
         advice_direction: Optional[str] = None,
         reviewer_notes: str = "",
         reviewer_id: str = "",
+        failure_tags: Optional[List[str]] = None,
     ) -> HumanEvaluation:
         """Doctor submits an evaluation for a pending record.
 
@@ -177,6 +196,7 @@ class EvaluationService:
             advice_direction: Optional. correct / partial / wrong
             reviewer_notes: Optional. Free text from the doctor
             reviewer_id: Optional. Doctor identifier
+            failure_tags: Optional. List of failure classification tags
         """
         label_upper = label.strip().upper()
         if label_upper not in VALID_LABELS:
@@ -193,6 +213,17 @@ class EvaluationService:
                 f"Must be one of: {', '.join(sorted(VALID_ADVICE_DIRECTION))}"
             )
 
+        # Validate failure_tags
+        validated_tags: List[str] = []
+        if failure_tags:
+            invalid = [t for t in failure_tags if t not in VALID_FAILURE_TAGS]
+            if invalid:
+                raise ValueError(
+                    f"Invalid failure_tags: {invalid}. "
+                    f"Must be from: {', '.join(sorted(VALID_FAILURE_TAGS))}"
+                )
+            validated_tags = list(failure_tags)
+
         # Load evaluation
         evaluation = self._load_evaluation(evaluation_id)
         if evaluation is None:
@@ -205,6 +236,7 @@ class EvaluationService:
         evaluation.advice_direction = advice_direction
         evaluation.reviewer_notes = reviewer_notes
         evaluation.reviewer_id = reviewer_id
+        evaluation.failure_tags = validated_tags
         evaluation.timestamp = datetime.now().isoformat()
         evaluation.status = "completed"
 
